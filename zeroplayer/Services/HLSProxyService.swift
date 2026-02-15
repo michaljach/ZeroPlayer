@@ -102,6 +102,12 @@ final class HLSProxyService: SegmentGenerator {
             throw ProxyError.ffmpegFailed(error)
         }
         
+        // Step 4a: For HEVC, the fMP4 initialization segment (init.mp4) is now
+        // extracted automatically from the first media segment during remuxing.
+        // This guarantees the init segment's track IDs and codec parameters match
+        // the media segments exactly (they come from the same AVFormatContext).
+        // No separate generation step needed here.
+        
         // Step 4b: Extract the first subtitle (if any) and regenerate master.m3u8
         // so it's available in the initial playlist. This avoids the reload dance
         // that causes AirPlay receivers to miss the subtitle track.

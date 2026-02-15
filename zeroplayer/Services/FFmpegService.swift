@@ -90,6 +90,7 @@ final class FFmpegService {
         var hasVideo = false
         var hasAudio = false
         var needsAudioConversion = false
+        var isHEVC = false
         
         for i in 0..<nbStreams {
             let stream = inputCtx!.pointee.streams[i]!
@@ -99,6 +100,7 @@ final class FFmpegService {
                 hasVideo = true
                 videoWidth = codecpar.width
                 videoHeight = codecpar.height
+                isHEVC = codecpar.codec_id == AV_CODEC_ID_HEVC
                 if let desc = avcodec_descriptor_get(codecpar.codec_id) {
                     videoCodecName = String(cString: desc.pointee.name)
                 }
@@ -144,7 +146,8 @@ final class FFmpegService {
             videoCodec: videoCodecName,
             audioCodec: audioCodecName,
             needsConversion: nonNativeContainer || needsAudioConversion,
-            needsAudioConversion: needsAudioConversion
+            needsAudioConversion: needsAudioConversion,
+            isHEVC: isHEVC
         )
     }
 
@@ -196,22 +199,37 @@ final class FFmpegService {
         try? FileManager.default.removeItem(at: outputDirectory)
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         
+        // Cache HEVC flag for segment generation
+        self.sourceIsHEVC = videoInfo.isHEVC
+        
         // Calculate segments (10 seconds each)
         let segmentDuration = 10.0
         let totalSegments = Int(ceil(videoInfo.durationInSeconds / segmentDuration))
         
         // --- Write variant playlist (video.m3u8) with segment entries ---
         // IMPORTANT: No leading whitespace — M3U8 tags must start at column 0
+        let segExt = videoInfo.segmentExtension  // "mp4" for HEVC, "ts" for H.264
+        
         var variant = "#EXTM3U\n"
-        variant += "#EXT-X-VERSION:3\n"
+        if videoInfo.isHEVC {
+            // HEVC in HLS requires fMP4 segments with version 7+
+            variant += "#EXT-X-VERSION:7\n"
+        } else {
+            variant += "#EXT-X-VERSION:3\n"
+        }
         variant += "#EXT-X-TARGETDURATION:11\n"
         variant += "#EXT-X-MEDIA-SEQUENCE:0\n"
         variant += "#EXT-X-PLAYLIST-TYPE:VOD\n"
         
+        if videoInfo.isHEVC {
+            // fMP4 requires an initialization segment (moov atom)
+            variant += "#EXT-X-MAP:URI=\"init.mp4\"\n"
+        }
+        
         for i in 0..<totalSegments {
             let duration = min(segmentDuration, videoInfo.durationInSeconds - Double(i) * segmentDuration)
             variant += "#EXTINF:\(String(format: "%.3f", duration)),\n"
-            variant += "segment_\(String(format: "%03d", i)).ts\n"
+            variant += "segment_\(String(format: "%03d", i)).\(segExt)\n"
         }
         
         variant += "#EXT-X-ENDLIST\n"
@@ -234,7 +252,11 @@ final class FFmpegService {
     func buildMasterPlaylist(videoInfo: VideoInfo, subtitleTracks: [SubtitleTrack] = []) -> String {
         // IMPORTANT: No leading whitespace — M3U8 tags must start at column 0
         var master = "#EXTM3U\n"
-        master += "#EXT-X-VERSION:3\n"
+        if videoInfo.isHEVC {
+            master += "#EXT-X-VERSION:7\n"
+        } else {
+            master += "#EXT-X-VERSION:3\n"
+        }
         
         // Add subtitle media entries
         let hasSubtitles = !subtitleTracks.isEmpty
@@ -251,10 +273,20 @@ final class FFmpegService {
         let width = Int(videoInfo.size.width)
         let height = Int(videoInfo.size.height)
         
-        if hasSubtitles {
-            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height),SUBTITLES=\"subs\"\n"
+        // CODECS attribute: required for HEVC so AirPlay receivers know the codec.
+        // hvc1.2.4.L153.B0 = HEVC Main 10 Profile, Level 5.1 (conservative, widely compatible)
+        // mp4a.40.2 = AAC-LC
+        let codecsAttr: String
+        if videoInfo.isHEVC {
+            codecsAttr = ",CODECS=\"hvc1.2.4.L153.B0,mp4a.40.2\""
         } else {
-            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height)\n"
+            codecsAttr = ""
+        }
+        
+        if hasSubtitles {
+            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height)\(codecsAttr),SUBTITLES=\"subs\"\n"
+        } else {
+            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height)\(codecsAttr)\n"
         }
         master += "video.m3u8\n"
         
@@ -405,17 +437,22 @@ final class FFmpegService {
     
     // MARK: - Segment Generation
     
+    /// Cached flag: whether the current source file uses HEVC video.
+    /// Set by `analyzeVideoFileSync` / `generateHLSPlaylist` flows.
+    /// Used by `generateSegment` to pick the right file extension.
+    private(set) var sourceIsHEVC: Bool = false
+    
     /// Generates a single HLS segment on-the-fly.
     ///
     /// Strategy:
-    /// 1. For H.264+AAC sources (MP4/M4V/MOV): use FFmpeg C API to **remux**
-    ///    directly from MP4 to MPEG-TS without re-encoding. This is fast, reliable,
-    ///    and produces proper `.ts` segments that AirPlay receivers accept.
-    /// 2. For other sources (MKV, non-H.264 codecs): fall back to mpv encode mode.
+    /// 1. For H.264/HEVC sources: use FFmpeg C API to **remux** directly into
+    ///    MPEG-TS (H.264) or fMP4 (HEVC) without re-encoding.
+    /// 2. For other sources: fall back to mpv encode mode.
     ///
     /// Handles concurrent requests for the same segment by queuing waiters.
     func generateSegment(from sourceURL: URL, segmentIndex: Int, segmentDuration: Double = 10.0) async throws -> URL {
-        let segmentPath = outputDirectory.appendingPathComponent("segment_\(String(format: "%03d", segmentIndex)).ts")
+        let ext = sourceIsHEVC ? "mp4" : "ts"
+        let segmentPath = outputDirectory.appendingPathComponent("segment_\(String(format: "%03d", segmentIndex)).\(ext)")
         
         // Check if segment already exists (cached)
         if FileManager.default.fileExists(atPath: segmentPath.path) {
@@ -521,6 +558,79 @@ final class FFmpegService {
         return -tag
     }()
     
+    /// Strips leading `ftyp` and `moov` atoms from an fMP4 media segment file.
+    ///
+    /// FFmpeg's `empty_moov` movflag writes `ftyp`+`moov` at the start of every output,
+    /// but HLS fMP4 media segments should contain only `moof`+`mdat` (the init segment
+    /// provides the `ftyp`+`moov` via `EXT-X-MAP`). This reads the file, finds the first
+    /// `moof` atom, and rewrites the file starting from that point.
+    ///
+    /// If `saveInitSegmentTo` is provided, the stripped `ftyp`+`moov` bytes are saved
+    /// to that path as the HLS initialization segment (`init.mp4`). This guarantees
+    /// the init segment's track IDs, codec parameters, and AAC `extradata` match the
+    /// media segments exactly — they come from the same `AVFormatContext`.
+    ///
+    /// MP4 atom structure: 4 bytes size (big-endian) + 4 bytes type (ASCII).
+    /// If size == 1, the next 8 bytes are the 64-bit extended size.
+    private static func stripFtypMoovFromSegment(at path: String, saveInitSegmentTo initPath: String? = nil) throws {
+        guard let data = FileManager.default.contents(atPath: path) else {
+            print("stripFtypMoov: cannot read file at \(path)")
+            return
+        }
+        
+        // Scan atoms to find the offset of the first 'moof'
+        var offset = 0
+        let count = data.count
+        var moofOffset: Int? = nil
+        
+        while offset + 8 <= count {
+            let atomSize: Int = data.withUnsafeBytes { bytes in
+                let ptr = bytes.baseAddress!.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+                return (Int(ptr[0]) << 24) | (Int(ptr[1]) << 16) | (Int(ptr[2]) << 8) | Int(ptr[3])
+            }
+            let atomType: String = data.withUnsafeBytes { bytes in
+                let ptr = bytes.baseAddress!.advanced(by: offset + 4).assumingMemoryBound(to: UInt8.self)
+                return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+            }
+            
+            if atomType == "moof" {
+                moofOffset = offset
+                break
+            }
+            
+            // Advance to next atom
+            guard atomSize >= 8 else {
+                print("stripFtypMoov: invalid atom size \(atomSize) at offset \(offset)")
+                break
+            }
+            offset += atomSize
+        }
+        
+        guard let start = moofOffset, start > 0 else {
+            // No ftyp/moov prefix found, or file starts with moof already
+            if moofOffset == 0 {
+                print("stripFtypMoov: file already starts with moof")
+            } else {
+                print("stripFtypMoov: no moof atom found in \(path)")
+            }
+            return
+        }
+        
+        // Save the ftyp+moov prefix as the init segment if requested.
+        // This is the key fix for the track ID / codec parameter mismatch:
+        // the init segment comes from the SAME AVFormatContext as the media data.
+        if let initPath = initPath {
+            let initData = data.subdata(in: 0..<start)
+            try initData.write(to: URL(fileURLWithPath: initPath))
+            print("stripFtypMoov: saved init segment (\(start) bytes) to \(initPath)")
+        }
+        
+        // Rewrite the file starting from the moof atom
+        let trimmedData = data.subdata(in: start..<count)
+        try trimmedData.write(to: URL(fileURLWithPath: path))
+        print("stripFtypMoov: stripped \(start) bytes (ftyp+moov) from segment, \(count) -> \(trimmedData.count) bytes")
+    }
+    
     /// Converts an FFmpeg error code to a human-readable string.
     private static func ffmpegErrorString(_ errnum: Int32) -> String {
         var buf = [CChar](repeating: 0, count: 256)
@@ -589,9 +699,22 @@ final class FFmpegService {
             throw FFmpegError.conversionFailed("avformat_find_stream_info failed: \(Self.ffmpegErrorString(ret))")
         }
         
-        // --- Allocate output (MPEG-TS) ---
+        // --- Allocate output (MPEG-TS or fMP4 depending on video codec) ---
+        // Detect HEVC to decide output format
+        var isHEVCSource = false
+        let nbInputStreams = Int(inputCtx!.pointee.nb_streams)
+        for i in 0..<nbInputStreams {
+            let stream = inputCtx!.pointee.streams[i]!
+            if stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO {
+                isHEVCSource = stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+                break
+            }
+        }
+        
+        let outputFormat = isHEVCSource ? "mp4" : "mpegts"
+        
         var outputCtx: UnsafeMutablePointer<AVFormatContext>?
-        ret = avformat_alloc_output_context2(&outputCtx, nil, "mpegts", outputPath)
+        ret = avformat_alloc_output_context2(&outputCtx, nil, outputFormat, outputPath)
         guard ret >= 0, let outputCtxUnwrapped = outputCtx else {
             throw FFmpegError.conversionFailed("avformat_alloc_output_context2 failed: \(Self.ffmpegErrorString(ret))")
         }
@@ -624,7 +747,9 @@ final class FFmpegService {
         var audioDecCtx: UnsafeMutablePointer<AVCodecContext>?
         var audioEncCtx: UnsafeMutablePointer<AVCodecContext>?
         var swrCtx: OpaquePointer?  // SwrContext for sample format conversion
+        var audioFifo: OpaquePointer?  // AVAudioFifo* for buffering resampled audio
         var audioTranscodeInputIdx: Int = -1
+        var audioNextPts: Int64 = 0  // Running PTS counter for AAC encoder output
         
         for i in 0..<inputStreamCount {
             let inputStream = inputCtx!.pointee.streams[i]!
@@ -652,8 +777,14 @@ final class FFmpegService {
                 outStream.pointee.codecpar.pointee.codec_tag = 0
                 
             } else if codecType == AVMEDIA_TYPE_AUDIO {
-                if tsCompatibleAudio.contains(codecId) {
-                    // Audio can be copied directly
+                // For HEVC (fMP4), ALL audio must be transcoded to AAC to match
+                // the init segment. EAC3/AC3 can't be directly copied into fMP4
+                // with empty_moov movflags (FFmpeg can't build AudioSpecificConfig
+                // without parsing packets first, which isn't possible in init-only mode).
+                let canCopyAudio = !isHEVCSource && tsCompatibleAudio.contains(codecId)
+                
+                if canCopyAudio {
+                    // Audio can be copied directly (MPEG-TS output only)
                     streamMapping[i] = outputStreamIndex
                     audioNeedsTranscode[i] = false
                     outputStreamIndex += 1
@@ -667,9 +798,12 @@ final class FFmpegService {
                     }
                     outStream.pointee.codecpar.pointee.codec_tag = 0
                 } else if audioDecCtx == nil {
-                    // First incompatible audio stream — set up transcoding to AAC
+                    // First audio stream needing transcoding — set up transcoding to AAC
+                    // For HEVC/fMP4: all audio is forced to AAC to match init segment
+                    // For MPEG-TS: only TS-incompatible codecs (Opus, Vorbis, etc.)
                     let codecName = avcodec_descriptor_get(codecpar.codec_id).flatMap { String(cString: $0.pointee.name) } ?? "unknown"
-                    print("Audio stream \(i) ('\(codecName)') needs transcoding to AAC")
+                    let reason = isHEVCSource ? "HEVC/fMP4 requires AAC" : "codec not TS-compatible"
+                    print("Audio stream \(i) ('\(codecName)') needs transcoding to AAC (\(reason))")
                     
                     // Set up decoder
                     guard let decoder = avcodec_find_decoder(codecpar.codec_id) else {
@@ -764,6 +898,24 @@ final class FFmpegService {
                         continue
                     }
                     
+                    // Create AVAudioFifo to buffer resampled samples.
+                    // The decoder may output frames with different sizes (e.g. EAC3 = 1536 samples)
+                    // than the encoder expects (AAC = 1024 samples). The FIFO accumulates
+                    // resampled samples and we drain it in encoder-frame-size chunks.
+                    let fifoSampleFmt = encCtx.pointee.sample_fmt
+                    let fifoChannels = encCtx.pointee.ch_layout.nb_channels
+                    let fifoPtr = av_audio_fifo_alloc(fifoSampleFmt, fifoChannels, 1)
+                    guard fifoPtr != nil else {
+                        print("av_audio_fifo_alloc failed, skipping audio transcoding")
+                        swr_free(&swrCtx)
+                        avcodec_free_context(&audioDecCtx)
+                        audioDecCtx = nil
+                        avcodec_free_context(&audioEncCtx)
+                        audioEncCtx = nil
+                        continue
+                    }
+                    audioFifo = fifoPtr
+                    
                     // Create output stream for transcoded audio
                     guard let outStream = avformat_new_stream(outputCtxUnwrapped, nil) else {
                         throw FFmpegError.conversionFailed("avformat_new_stream failed for transcoded audio")
@@ -792,6 +944,9 @@ final class FFmpegService {
             if dec != nil { avcodec_free_context(&dec) }
             if enc != nil { avcodec_free_context(&enc) }
             if swrCtx != nil { swr_free(&swrCtx) }
+            if let fifo = audioFifo {
+                av_audio_fifo_free(fifo)
+            }
         }
         
         guard outputStreamIndex > 0 else {
@@ -808,7 +963,15 @@ final class FFmpegService {
         }
         
         // --- Write header ---
-        ret = avformat_write_header(outputCtxUnwrapped, nil)
+        // For HEVC (fMP4), set movflags for fragmented MP4 output.
+        // Must match the init segment's movflags exactly.
+        var muxOpts: OpaquePointer?  // AVDictionary*
+        if isHEVCSource {
+            av_dict_set(&muxOpts, "movflags", "empty_moov+frag_keyframe+default_base_moof", 0)
+        }
+        // Pass &muxOpts always — it's nil for non-HEVC (MPEG-TS), which is fine.
+        ret = avformat_write_header(outputCtxUnwrapped, &muxOpts)
+        av_dict_free(&muxOpts)
         guard ret >= 0 else {
             if (oformat.pointee.flags & AVFMT_NOFILE) == 0 {
                 avio_closep(&outputCtxUnwrapped.pointee.pb)
@@ -847,14 +1010,11 @@ final class FFmpegService {
         
         // Frame for audio transcoding
         var frame: UnsafeMutablePointer<AVFrame>?
-        var resampledFrame: UnsafeMutablePointer<AVFrame>?
         if audioDecCtx != nil {
             frame = av_frame_alloc()
-            resampledFrame = av_frame_alloc()
         }
         defer {
             av_frame_free(&frame)
-            av_frame_free(&resampledFrame)
         }
         
         var wroteAnyPacket = false
@@ -910,9 +1070,12 @@ final class FFmpegService {
                let decCtx = audioDecCtx,
                let encCtx = audioEncCtx,
                let audioFrame = frame,
-               let resFrame = resampledFrame,
-               swrCtx != nil {
-                // --- Transcode audio: decode -> resample -> encode to AAC ---
+               swrCtx != nil,
+               let fifo = audioFifo {
+                // --- Transcode audio: decode -> resample -> FIFO -> encode AAC ---
+                // The FIFO buffers resampled samples so we can feed the AAC encoder
+                // exactly frame_size (1024) samples at a time, regardless of the
+                // decoder's output frame size (e.g. EAC3 = 1536 samples).
                 ret = avcodec_send_packet(decCtx, pkt)
                 av_packet_unref(pkt)
                 if ret < 0 { continue }
@@ -921,54 +1084,86 @@ final class FFmpegService {
                     ret = avcodec_receive_frame(decCtx, audioFrame)
                     if ret < 0 { break }
                     
-                    // Save PTS before conversion (swr_convert_frame may clobber it)
-                    let framePTS = audioFrame.pointee.best_effort_timestamp
+                    // Resample using swr_convert_frame into a temporary frame
+                    var resFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+                    guard let rf = resFrame else { break }
+                    rf.pointee.sample_rate = encCtx.pointee.sample_rate
+                    rf.pointee.format = encCtx.pointee.sample_fmt.rawValue
+                    rf.pointee.ch_layout = encCtx.pointee.ch_layout
                     
-                    // Resample using swr_convert_frame (much simpler than manual swr_convert)
-                    resFrame.pointee.sample_rate = encCtx.pointee.sample_rate
-                    resFrame.pointee.format = encCtx.pointee.sample_fmt.rawValue
-                    resFrame.pointee.ch_layout = encCtx.pointee.ch_layout
-                    
-                    ret = swr_convert_frame(swrCtx, resFrame, audioFrame)
+                    ret = swr_convert_frame(swrCtx, rf, audioFrame)
                     av_frame_unref(audioFrame)
                     
                     if ret < 0 {
-                        av_frame_unref(resFrame)
+                        av_frame_free(&resFrame)
                         continue
                     }
-                    // Only set PTS if valid (avNoPTS = 0x8000000000000000 would poison encoder)
-                    resFrame.pointee.pts = (framePTS != avNoPTS) ? framePTS : resFrame.pointee.pts
                     
-                    ret = avcodec_send_frame(encCtx, resFrame)
-                    av_frame_unref(resFrame)
-                    if ret < 0 { continue }
-                    
-                    // Read encoded packets
-                    let encPkt = av_packet_alloc()!
-                    defer {
-                        var ep: UnsafeMutablePointer<AVPacket>? = encPkt
-                        av_packet_free(&ep)
+                    let convertedSamples = rf.pointee.nb_samples
+                    if convertedSamples > 0 {
+                        // Write resampled samples to FIFO using the frame's extended_data
+                        if let extData = rf.pointee.extended_data {
+                            extData.withMemoryRebound(to: UnsafeMutableRawPointer?.self, capacity: 8) { rawPtr in
+                                _ = av_audio_fifo_write(fifo, rawPtr, convertedSamples)
+                            }
+                        }
                     }
-                    while true {
-                        ret = avcodec_receive_packet(encCtx, encPkt)
-                        if ret < 0 { break }
+                    av_frame_free(&resFrame)
+                    
+                    // Drain FIFO in encoder frame_size chunks
+                    let frameSize = Int(encCtx.pointee.frame_size)
+                    while av_audio_fifo_size(fifo) >= Int32(frameSize) {
+                        var encFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+                        guard let ef = encFrame else { break }
+                        ef.pointee.nb_samples = Int32(frameSize)
+                        ef.pointee.format = encCtx.pointee.sample_fmt.rawValue
+                        ef.pointee.ch_layout = encCtx.pointee.ch_layout
+                        ef.pointee.sample_rate = encCtx.pointee.sample_rate
                         
-                        encPkt.pointee.stream_index = Int32(outIdx)
-                        av_packet_rescale_ts(encPkt, encCtx.pointee.time_base, outputStream.pointee.time_base)
+                        ret = av_frame_get_buffer(ef, 0)
+                        guard ret >= 0 else {
+                            av_frame_free(&encFrame)
+                            break
+                        }
                         
-                        if encPkt.pointee.dts < 0 {
-                            // Use overflow-safe arithmetic — MKV timestamps can be huge
-                            let offset = Int64(bitPattern: 0) &- encPkt.pointee.dts
-                            encPkt.pointee.dts = 0
-                            if encPkt.pointee.pts != avNoPTS {
-                                let newPTS = encPkt.pointee.pts &+ offset
-                                encPkt.pointee.pts = newPTS < 0 ? 0 : newPTS
+                        // Read samples from FIFO into the frame's data buffers
+                        withUnsafeMutablePointer(to: &ef.pointee.data) { dataPtr in
+                            dataPtr.withMemoryRebound(to: UnsafeMutableRawPointer?.self, capacity: 8) { rawPtr in
+                                _ = av_audio_fifo_read(fifo, rawPtr, Int32(frameSize))
                             }
                         }
                         
-                        encPkt.pointee.pos = -1
-                        ret = av_interleaved_write_frame(outputCtxUnwrapped, encPkt)
-                        if ret >= 0 { wroteAnyPacket = true }
+                        ef.pointee.pts = audioNextPts
+                        audioNextPts = audioNextPts &+ Int64(frameSize)
+                        
+                        ret = avcodec_send_frame(encCtx, ef)
+                        av_frame_free(&encFrame)
+                        if ret < 0 { continue }
+                        
+                        // Read encoded packets
+                        let encPkt = av_packet_alloc()!
+                        while true {
+                            ret = avcodec_receive_packet(encCtx, encPkt)
+                            if ret < 0 { break }
+                            
+                            encPkt.pointee.stream_index = Int32(outIdx)
+                            av_packet_rescale_ts(encPkt, encCtx.pointee.time_base, outputStream.pointee.time_base)
+                            
+                            if encPkt.pointee.dts < 0 {
+                                let offset = Int64(bitPattern: 0) &- encPkt.pointee.dts
+                                encPkt.pointee.dts = 0
+                                if encPkt.pointee.pts != avNoPTS {
+                                    let newPTS = encPkt.pointee.pts &+ offset
+                                    encPkt.pointee.pts = newPTS < 0 ? 0 : newPTS
+                                }
+                            }
+                            
+                            encPkt.pointee.pos = -1
+                            ret = av_interleaved_write_frame(outputCtxUnwrapped, encPkt)
+                            if ret >= 0 { wroteAnyPacket = true }
+                        }
+                        var ep: UnsafeMutablePointer<AVPacket>? = encPkt
+                        av_packet_free(&ep)
                     }
                 }
                 continue
@@ -994,6 +1189,93 @@ final class FFmpegService {
                 print("Warning: av_interleaved_write_frame failed: \(Self.ffmpegErrorString(ret))")
             } else {
                 wroteAnyPacket = true
+            }
+        }
+        
+        // Flush resampler — drain any buffered samples in SwrContext
+        if let swr = swrCtx, let encCtx = audioEncCtx, let fifo = audioFifo {
+            // Flush swr: pass nil input to swr_convert_frame to get remaining buffered samples
+            while true {
+                var flushFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+                guard let ff = flushFrame else { break }
+                ff.pointee.sample_rate = encCtx.pointee.sample_rate
+                ff.pointee.format = encCtx.pointee.sample_fmt.rawValue
+                ff.pointee.ch_layout = encCtx.pointee.ch_layout
+                
+                ret = swr_convert_frame(swr, ff, nil)
+                if ret < 0 || ff.pointee.nb_samples == 0 {
+                    av_frame_free(&flushFrame)
+                    break
+                }
+                
+                // Write flushed samples to FIFO
+                let flushedSamples = ff.pointee.nb_samples
+                if flushedSamples > 0 {
+                    if let extData = ff.pointee.extended_data {
+                        extData.withMemoryRebound(to: UnsafeMutableRawPointer?.self, capacity: 8) { rawPtr in
+                            _ = av_audio_fifo_write(fifo, rawPtr, flushedSamples)
+                        }
+                    }
+                }
+                av_frame_free(&flushFrame)
+            }
+            
+            // Drain remaining FIFO samples (may be less than frame_size — that's OK for final frame)
+            let frameSize = Int(encCtx.pointee.frame_size)
+            let outIdx = streamMapping[audioTranscodeInputIdx]
+            let outputStream = outputCtxUnwrapped.pointee.streams[outIdx]!
+            
+            while av_audio_fifo_size(fifo) > 0 {
+                let samplesToRead = min(Int(av_audio_fifo_size(fifo)), frameSize)
+                var encFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+                guard let ef = encFrame else { break }
+                ef.pointee.nb_samples = Int32(samplesToRead)
+                ef.pointee.format = encCtx.pointee.sample_fmt.rawValue
+                ef.pointee.ch_layout = encCtx.pointee.ch_layout
+                ef.pointee.sample_rate = encCtx.pointee.sample_rate
+                
+                ret = av_frame_get_buffer(ef, 0)
+                guard ret >= 0 else {
+                    av_frame_free(&encFrame)
+                    break
+                }
+                
+                withUnsafeMutablePointer(to: &ef.pointee.data) { dataPtr in
+                    dataPtr.withMemoryRebound(to: UnsafeMutableRawPointer?.self, capacity: 8) { rawPtr in
+                        _ = av_audio_fifo_read(fifo, rawPtr, Int32(samplesToRead))
+                    }
+                }
+                
+                ef.pointee.pts = audioNextPts
+                audioNextPts = audioNextPts &+ Int64(samplesToRead)
+                
+                ret = avcodec_send_frame(encCtx, ef)
+                av_frame_free(&encFrame)
+                if ret < 0 { break }
+                
+                let encPkt = av_packet_alloc()!
+                while true {
+                    ret = avcodec_receive_packet(encCtx, encPkt)
+                    if ret < 0 { break }
+                    
+                    encPkt.pointee.stream_index = Int32(outIdx)
+                    av_packet_rescale_ts(encPkt, encCtx.pointee.time_base, outputStream.pointee.time_base)
+                    
+                    if encPkt.pointee.dts < 0 {
+                        let offset = Int64(bitPattern: 0) &- encPkt.pointee.dts
+                        encPkt.pointee.dts = 0
+                        if encPkt.pointee.pts != avNoPTS {
+                            let newPTS = encPkt.pointee.pts &+ offset
+                            encPkt.pointee.pts = newPTS < 0 ? 0 : newPTS
+                        }
+                    }
+                    
+                    encPkt.pointee.pos = -1
+                    ret = av_interleaved_write_frame(outputCtxUnwrapped, encPkt)
+                    if ret >= 0 { wroteAnyPacket = true }
+                }
+                var ep: UnsafeMutablePointer<AVPacket>? = encPkt
+                av_packet_free(&ep)
             }
         }
         
@@ -1042,6 +1324,28 @@ final class FFmpegService {
             avio_closep(&outputCtxUnwrapped.pointee.pb)
         }
         
+        // For HEVC fMP4 media segments: strip the leading ftyp+moov atoms.
+        // FFmpeg's empty_moov movflag writes ftyp+moov at the start of every output,
+        // but HLS fMP4 media segments must contain only moof+mdat (the init segment
+        // provides ftyp+moov via EXT-X-MAP). AirPlay receivers reject segments that
+        // duplicate the moov atom.
+        //
+        // KEY FIX: If init.mp4 doesn't exist yet, extract the ftyp+moov prefix from
+        // this segment and save it as the init segment. This guarantees the init
+        // segment's track IDs, codec params, and AAC extradata are identical to those
+        // in the media segments — they literally come from the same AVFormatContext.
+        // Previously, init.mp4 was generated by a separate AVFormatContext which
+        // could produce different track IDs and AAC AudioSpecificConfig, causing
+        // AirPlay receivers to reject the stream with error -15562.
+        if isHEVCSource {
+            let initPath = outputDirectory.appendingPathComponent("init.mp4").path
+            let needsInitSegment = !FileManager.default.fileExists(atPath: initPath)
+            try Self.stripFtypMoovFromSegment(
+                at: outputPath,
+                saveInitSegmentTo: needsInitSegment ? initPath : nil
+            )
+        }
+        
         guard wroteAnyPacket else {
             throw FFmpegError.conversionFailed("No packets written to segment")
         }
@@ -1049,9 +1353,8 @@ final class FFmpegService {
         return outputURL
     }
 
+    // MARK: - mpv Encode Mode (Fallback)
     
-    
-    /// Runs a headless mpv encode session to produce an MPEG-TS segment.
     ///
     /// Uses mpv's `--o` (encode mode) with VideoToolbox hardware encoding,
     /// falling back to libx264 software encoding if VT fails.
@@ -1347,6 +1650,14 @@ final class FFmpegService {
                     let codecStr = mpv_get_property_string(mpv, "track-list/\(i)/codec")
                     let codec = codecStr.map { String(cString: $0) }
                     mpv_free(codecStr)
+                    
+                    // Skip bitmap-based subtitle codecs (PGS, DVB, DVD/VobSub) —
+                    // these are image-based and can't be converted to WebVTT text
+                    let bitmapCodecs: Set<String> = ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "dvb_teletext"]
+                    if let codec = codec, bitmapCodecs.contains(codec) {
+                        print("   Skipping bitmap subtitle: stream \(i), codec: \(codec)")
+                        continue
+                    }
                     
                     // mpv uses its own track IDs, but for FFmpeg stream mapping we need
                     // the demuxer index. mpv's track-list/N/demux-id or
@@ -1792,6 +2103,7 @@ final class FFmpegService {
     
     /// Cleans up temporary files
     func cleanup() {
+        sourceIsHEVC = false
         try? FileManager.default.removeItem(at: outputDirectory)
     }
 }
