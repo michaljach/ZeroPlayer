@@ -1,0 +1,44 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.moved-aside
+xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+
+# CocoaPods (unused, legacy Podfile)
+Pods/
+Podfile.lock
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Xcode workspace settings (user-specific)
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# App data
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Provisioning
+*.mobileprovision
+*.provisionprofile
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# Frameworks (resolved via SPM, not vendored)
+Frameworks/

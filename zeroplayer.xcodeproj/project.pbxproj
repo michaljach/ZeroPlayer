@@ -6,14 +6,57 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		82CDA1E62F4223F6006441CC /* MPVKit-GPL in Frameworks */ = {isa = PBXBuildFile; productRef = 82CDA1E52F4223F6006441CC /* MPVKit-GPL */; };
+		82CDA2FB2F42375A006441CC /* ComposableArchitecture in Frameworks */ = {isa = PBXBuildFile; productRef = 82CDA2FA2F42375A006441CC /* ComposableArchitecture */; };
+		83A100202F50000100AAA111 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001D2F50000100AAA111 /* Dependencies */; };
+		83A100212F50000100AAA111 /* CasePaths in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001E2F50000100AAA111 /* CasePaths */; };
+		83A100222F50000100AAA111 /* ConcurrencyExtras in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001F2F50000100AAA111 /* ConcurrencyExtras */; };
+		83A100032F50000100AAA111 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83A100022F50000100AAA111 /* XCTest.framework */; };
+		83A1000E2F50000100AAA111 /* ComposableArchitecture in Frameworks */ = {isa = PBXBuildFile; productRef = 82CDA2FA2F42375A006441CC /* ComposableArchitecture */; };
+		83A100232F50000100AAA111 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001D2F50000100AAA111 /* Dependencies */; };
+		83A100242F50000100AAA111 /* CasePaths in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001E2F50000100AAA111 /* CasePaths */; };
+		83A100252F50000100AAA111 /* ConcurrencyExtras in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001F2F50000100AAA111 /* ConcurrencyExtras */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		83A100092F50000100AAA111 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 8220CC522F3FD16D00C78E46 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 8220CC592F3FD16D00C78E46;
+			remoteInfo = zeroplayer;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		8220CC5A2F3FD16D00C78E46 /* zeroplayer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = zeroplayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		83A100012F50000100AAA111 /* zeroplayerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = zeroplayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		83A100022F50000100AAA111 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = System/Library/Frameworks/XCTest.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		8220CC902F407400006441CC /* Exceptions for "zeroplayer" folder in "zeroplayer" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 8220CC592F3FD16D00C78E46 /* zeroplayer */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		8220CC5C2F3FD16D00C78E46 /* zeroplayer */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				8220CC902F407400006441CC /* Exceptions for "zeroplayer" folder in "zeroplayer" target */,
+			);
 			path = zeroplayer;
+			sourceTree = "<group>";
+		};
+		83A100042F50000100AAA111 /* zeroplayerTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = zeroplayerTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -23,6 +66,23 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				83A100222F50000100AAA111 /* ConcurrencyExtras in Frameworks */,
+				83A100212F50000100AAA111 /* CasePaths in Frameworks */,
+				83A100202F50000100AAA111 /* Dependencies in Frameworks */,
+				82CDA2FB2F42375A006441CC /* ComposableArchitecture in Frameworks */,
+				82CDA1E62F4223F6006441CC /* MPVKit-GPL in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		83A100052F50000100AAA111 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				83A100252F50000100AAA111 /* ConcurrencyExtras in Frameworks */,
+				83A100242F50000100AAA111 /* CasePaths in Frameworks */,
+				83A100232F50000100AAA111 /* Dependencies in Frameworks */,
+				83A1000E2F50000100AAA111 /* ComposableArchitecture in Frameworks */,
+				83A100032F50000100AAA111 /* XCTest.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -33,7 +93,9 @@
 			isa = PBXGroup;
 			children = (
 				8220CC5C2F3FD16D00C78E46 /* zeroplayer */,
+				83A100042F50000100AAA111 /* zeroplayerTests */,
 				8220CC5B2F3FD16D00C78E46 /* Products */,
+				82CDA3282F423E91006441CC /* Recovered References */,
 			);
 			sourceTree = "<group>";
 		};
@@ -41,8 +103,17 @@
 			isa = PBXGroup;
 			children = (
 				8220CC5A2F3FD16D00C78E46 /* zeroplayer.app */,
+				83A100012F50000100AAA111 /* zeroplayerTests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		82CDA3282F423E91006441CC /* Recovered References */ = {
+			isa = PBXGroup;
+			children = (
+				83A100022F50000100AAA111 /* XCTest.framework */,
+			);
+			name = "Recovered References";
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -65,10 +136,42 @@
 			);
 			name = zeroplayer;
 			packageProductDependencies = (
+				82CDA1E52F4223F6006441CC /* MPVKit-GPL */,
+				82CDA2FA2F42375A006441CC /* ComposableArchitecture */,
+				83A1001D2F50000100AAA111 /* Dependencies */,
+				83A1001E2F50000100AAA111 /* CasePaths */,
+				83A1001F2F50000100AAA111 /* ConcurrencyExtras */,
 			);
 			productName = zeroplayer;
 			productReference = 8220CC5A2F3FD16D00C78E46 /* zeroplayer.app */;
 			productType = "com.apple.product-type.application";
+		};
+		83A100082F50000100AAA111 /* zeroplayerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 83A1000D2F50000100AAA111 /* Build configuration list for PBXNativeTarget "zeroplayerTests" */;
+			buildPhases = (
+				83A100072F50000100AAA111 /* Sources */,
+				83A100052F50000100AAA111 /* Frameworks */,
+				83A100062F50000100AAA111 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				83A1000A2F50000100AAA111 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				83A100042F50000100AAA111 /* zeroplayerTests */,
+			);
+			name = zeroplayerTests;
+			packageProductDependencies = (
+				82CDA2FA2F42375A006441CC /* ComposableArchitecture */,
+				83A1001D2F50000100AAA111 /* Dependencies */,
+				83A1001E2F50000100AAA111 /* CasePaths */,
+				83A1001F2F50000100AAA111 /* ConcurrencyExtras */,
+			);
+			productName = zeroplayerTests;
+			productReference = 83A100012F50000100AAA111 /* zeroplayerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
 
@@ -83,6 +186,10 @@
 					8220CC592F3FD16D00C78E46 = {
 						CreatedOnToolsVersion = 26.2;
 					};
+					83A100082F50000100AAA111 = {
+						CreatedOnToolsVersion = 26.2;
+						TestTargetID = 8220CC592F3FD16D00C78E46;
+					};
 				};
 			};
 			buildConfigurationList = 8220CC552F3FD16D00C78E46 /* Build configuration list for PBXProject "zeroplayer" */;
@@ -94,18 +201,33 @@
 			);
 			mainGroup = 8220CC512F3FD16D00C78E46;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				82CDA1E22F4223F6006441CC /* XCRemoteSwiftPackageReference "MPVKit" */,
+				82CDA2F92F42375A006441CC /* XCRemoteSwiftPackageReference "swift-composable-architecture" */,
+				83A1001A2F50000100AAA111 /* XCRemoteSwiftPackageReference "swift-dependencies" */,
+				83A1001B2F50000100AAA111 /* XCRemoteSwiftPackageReference "swift-case-paths" */,
+				83A1001C2F50000100AAA111 /* XCRemoteSwiftPackageReference "swift-concurrency-extras" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 8220CC5B2F3FD16D00C78E46 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				8220CC592F3FD16D00C78E46 /* zeroplayer */,
+				83A100082F50000100AAA111 /* zeroplayerTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		8220CC582F3FD16D00C78E46 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		83A100062F50000100AAA111 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -122,7 +244,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		83A100072F50000100AAA111 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		83A1000A2F50000100AAA111 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 8220CC592F3FD16D00C78E46 /* zeroplayer */;
+			targetProxy = 83A100092F50000100AAA111 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		8220CC632F3FD16E00C78E46 /* Debug */ = {
@@ -249,11 +386,12 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = A6GVRYGG7C;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = zeroplayer/Info.plist;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -281,7 +419,6 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
-				XROS_DEPLOYMENT_TARGET = 26.2;
 			};
 			name = Debug;
 		};
@@ -293,11 +430,12 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = A6GVRYGG7C;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = zeroplayer/Info.plist;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -329,6 +467,54 @@
 			};
 			name = Release;
 		};
+		83A1000B2F50000100AAA111 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = A6GVRYGG7C;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = me.jach.zeroplayerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/zeroplayer.app/zeroplayer";
+				TEST_TARGET_NAME = zeroplayer;
+			};
+			name = Debug;
+		};
+		83A1000C2F50000100AAA111 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = A6GVRYGG7C;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = me.jach.zeroplayerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/zeroplayer.app/zeroplayer";
+				TEST_TARGET_NAME = zeroplayer;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -350,7 +536,87 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		83A1000D2F50000100AAA111 /* Build configuration list for PBXNativeTarget "zeroplayerTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				83A1000B2F50000100AAA111 /* Debug */,
+				83A1000C2F50000100AAA111 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		82CDA1E22F4223F6006441CC /* XCRemoteSwiftPackageReference "MPVKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/mpvkit/MPVKit.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.41.0;
+			};
+		};
+		82CDA2F92F42375A006441CC /* XCRemoteSwiftPackageReference "swift-composable-architecture" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-composable-architecture";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.23.1;
+			};
+		};
+		83A1001A2F50000100AAA111 /* XCRemoteSwiftPackageReference "swift-dependencies" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-dependencies";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.11.0;
+			};
+		};
+		83A1001B2F50000100AAA111 /* XCRemoteSwiftPackageReference "swift-case-paths" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-case-paths";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.7.2;
+			};
+		};
+		83A1001C2F50000100AAA111 /* XCRemoteSwiftPackageReference "swift-concurrency-extras" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-concurrency-extras";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.3.2;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		82CDA1E52F4223F6006441CC /* MPVKit-GPL */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 82CDA1E22F4223F6006441CC /* XCRemoteSwiftPackageReference "MPVKit" */;
+			productName = "MPVKit-GPL";
+		};
+		82CDA2FA2F42375A006441CC /* ComposableArchitecture */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 82CDA2F92F42375A006441CC /* XCRemoteSwiftPackageReference "swift-composable-architecture" */;
+			productName = ComposableArchitecture;
+		};
+		83A1001D2F50000100AAA111 /* Dependencies */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 83A1001A2F50000100AAA111 /* XCRemoteSwiftPackageReference "swift-dependencies" */;
+			productName = Dependencies;
+		};
+		83A1001E2F50000100AAA111 /* CasePaths */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 83A1001B2F50000100AAA111 /* XCRemoteSwiftPackageReference "swift-case-paths" */;
+			productName = CasePaths;
+		};
+		83A1001F2F50000100AAA111 /* ConcurrencyExtras */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 83A1001C2F50000100AAA111 /* XCRemoteSwiftPackageReference "swift-concurrency-extras" */;
+			productName = ConcurrencyExtras;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 8220CC522F3FD16D00C78E46 /* Project object */;
 }

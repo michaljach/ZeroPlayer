@@ -1,17 +1,15 @@
-//
-//  zeroplayerApp.swift
-//  zeroplayer
-//
-//  Created by Michal Jach on 13/02/2026.
-//
-
 import SwiftUI
+import ComposableArchitecture
 
 @main
 struct zeroplayerApp: App {
+    let store = Store(initialState: AppFeature.State()) {
+        AppFeature()
+    }
+    
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            AppView(store: store)
         }
     }
 }
