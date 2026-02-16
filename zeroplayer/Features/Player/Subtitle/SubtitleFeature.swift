@@ -10,6 +10,7 @@ struct SubtitleFeature: Reducer {
         var selectedMPVTrackId: Int? = nil
         var isShowingFilePicker = false
         var error: String? = nil
+        var isDownloading = false
         var hlsTracks: [SubtitleTrack] = []
         var selectedHLSTrack: SubtitleTrack? = nil
     }
@@ -27,6 +28,9 @@ struct SubtitleFeature: Reducer {
         case hlsSelectedSubtitleUpdated(SubtitleTrack?)
 
         case loadFromFileTapped
+        case downloadFromInternetTapped
+        case downloadSucceeded(URL)
+        case downloadFailed(String)
         case filePickerDismissed
         case filePickerResult(Result<[URL], Error>)
 
@@ -38,6 +42,7 @@ struct SubtitleFeature: Reducer {
             case selectHLSSubtitle(SubtitleTrack)
             case disableHLSSubtitles
             case addExternalSubtitleHLS(URL)
+            case downloadFromInternetRequested
         }
     }
 
@@ -76,6 +81,20 @@ struct SubtitleFeature: Reducer {
 
         case .loadFromFileTapped:
             state.isShowingFilePicker = true
+            return .none
+
+        case .downloadFromInternetTapped:
+            state.isDownloading = true
+            state.error = nil
+            return .send(.delegate(.downloadFromInternetRequested))
+
+        case .downloadSucceeded:
+            state.isDownloading = false
+            return .none
+
+        case .downloadFailed(let message):
+            state.isDownloading = false
+            state.error = message
             return .none
 
         case .filePickerDismissed:

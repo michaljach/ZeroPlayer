@@ -22,6 +22,7 @@ struct PlayerFeature: Reducer {
 
         var avPlayerSeekPosition: Double = 0
         var hlsPlaybackURL: URL? = nil
+        var pendingMPVExternalSubtitleURL: URL? = nil
     }
 
     @CasePathable
@@ -63,10 +64,12 @@ struct PlayerFeature: Reducer {
         case hideControls
         case hlsPreparation
         case subtitleSelection
+        case subtitleDownload
     }
 
     @Dependency(\.continuousClock) var clock
     @Dependency(\.hlsClient) var hlsClient
+    @Dependency(\.subtitleDownloadClient) var subtitleDownloadClient
 
     func reduce(into state: inout State, action: Action) -> Effect<Action> {
         switch action {
@@ -202,8 +205,13 @@ struct PlayerFeature: Reducer {
                 .reduce(into: &state.subtitle, action: subtitleAction)
                 .map(Action.subtitle)
 
+            if case .mpvExternalSubtitleLoaded = subtitleAction {
+                state.pendingMPVExternalSubtitleURL = nil
+            }
+
             switch subtitleAction {
-            case .delegate(.loadExternalSubtitleMPV):
+            case .delegate(.loadExternalSubtitleMPV(let url)):
+                state.pendingMPVExternalSubtitleURL = url
                 return childEffect
 
             case .delegate(.selectHLSSubtitle(let track)):
@@ -246,6 +254,29 @@ struct PlayerFeature: Reducer {
                         print("HLS external subtitle add failed: \(error)")
                     }
                 }
+                return .merge(childEffect, effect)
+
+            case .delegate(.downloadFromInternetRequested):
+                let sourceFileURL = state.sourceFileURL
+                let isAirPlaying = state.airPlay.isAirPlaying
+                let subtitleDownloader = self.subtitleDownloadClient
+                let effect: Effect<Action> = .run { send in
+                    do {
+                        let subtitleURL = try await subtitleDownloader.downloadBestSubtitle(sourceFileURL)
+                        await send(.subtitle(.downloadSucceeded(subtitleURL)))
+
+                        if isAirPlaying {
+                            await send(.subtitle(.delegate(.addExternalSubtitleHLS(subtitleURL))))
+                        } else {
+                            await send(.subtitle(.delegate(.loadExternalSubtitleMPV(subtitleURL))))
+                        }
+                    } catch {
+                        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                        await send(.subtitle(.downloadFailed(message)))
+                    }
+                }
+                .cancellable(id: CancelID.subtitleDownload, cancelInFlight: true)
+
                 return .merge(childEffect, effect)
 
             default:

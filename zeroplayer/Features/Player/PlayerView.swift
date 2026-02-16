@@ -83,6 +83,11 @@ struct PlayerView: View {
             guard store.airPlay.isAirPlaying, newVersion > 0, newVersion != oldVersion else { return }
             reloadAVPlayerForSubtitleChange()
         }
+        .onChange(of: store.pendingMPVExternalSubtitleURL) { _, newURL in
+            guard let newURL else { return }
+            mpvController?.addExternalSubtitle(newURL.path)
+            store.send(.subtitle(.mpvExternalSubtitleLoaded(newURL.path)))
+        }
     }
     
     // MARK: - MPV Player View
@@ -442,6 +447,16 @@ struct PlayerView: View {
             } label: {
                 Label("Load from File...", systemImage: "doc.badge.plus")
             }
+
+            Button {
+                store.send(.subtitle(.downloadFromInternetTapped))
+            } label: {
+                Label(
+                    store.subtitle.isDownloading ? "Downloading..." : "Download from Internet",
+                    systemImage: store.subtitle.isDownloading ? "arrow.down.circle.fill" : "arrow.down.circle"
+                )
+            }
+            .disabled(store.subtitle.isDownloading)
         } label: {
             Image(systemName: store.subtitle.selectedMPVTrackId != nil ? "captions.bubble.fill" : "captions.bubble")
                 .font(.system(size: 22))
@@ -492,6 +507,16 @@ struct PlayerView: View {
             } label: {
                 Label("Load from File...", systemImage: "doc.badge.plus")
             }
+
+            Button {
+                store.send(.subtitle(.downloadFromInternetTapped))
+            } label: {
+                Label(
+                    store.subtitle.isDownloading ? "Downloading..." : "Download from Internet",
+                    systemImage: store.subtitle.isDownloading ? "arrow.down.circle.fill" : "arrow.down.circle"
+                )
+            }
+            .disabled(store.subtitle.isDownloading)
         } label: {
             Image(systemName: store.subtitle.selectedHLSTrack != nil ? "captions.bubble.fill" : "captions.bubble")
                 .font(.system(size: 22))

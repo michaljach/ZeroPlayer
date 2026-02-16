@@ -64,6 +64,12 @@ find ~/Library/Developer/Xcode/DerivedData/zeroplayer-*/SourcePackages \
   -exec sed -i '' '/hwcontext_amf\.h/d' {} \;
 ```
 
+### API Keys (local only)
+
+- Copy `zeroplayer/Config/APIKeys.example.plist` to `zeroplayer/Config/APIKeys.plist`
+- Set `TMDB_API_KEY` in that file (v3 API key or v4 read token)
+- `APIKeys.plist` is gitignored and not committed
+
 ## Project Structure
 
 ```

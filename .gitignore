@@ -42,3 +42,6 @@ playground.xcworkspace
 
 # Frameworks (resolved via SPM, not vendored)
 Frameworks/
+
+# Local API secrets
+zeroplayer/Config/APIKeys.plist
