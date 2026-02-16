@@ -5,6 +5,7 @@ import Libavformat
 import Libavcodec
 import Libavutil
 import Libswresample
+import Libswscale
 
 /// Service responsible for video transcoding, subtitle extraction, and HLS playlist generation.
 /// Uses libmpv (via MPVKit) for all media operations — no FFmpegKit dependency.
@@ -30,9 +31,14 @@ final class FFmpegService {
     /// for the same segment index. Maps segment index -> continuation list.
     private var inFlightSegments: [Int: [CheckedContinuation<URL, Error>]] = [:]
     
-    /// Serial queue for encoding — only one mpv encode instance runs at a time
-    /// to avoid resource exhaustion (each instance does software decode + HW encode).
-    private let encodeQueue = DispatchQueue(label: "com.zeroplayer.encode", qos: .userInitiated)
+    /// Concurrent queue for encoding — allows multiple segments to transcode in parallel.
+    /// Parallelism is bounded by `encodeSemaphore` to avoid resource exhaustion.
+    private let encodeQueue = DispatchQueue(label: "com.zeroplayer.encode", qos: .userInitiated, attributes: .concurrent)
+    
+    /// Limits concurrent transcode operations. On iPhone, 2 concurrent transcodes
+    /// (each using multi-threaded HEVC decode + VideoToolbox H.264 encode) provides
+    /// good throughput without saturating CPU or memory.
+    private let encodeSemaphore = DispatchSemaphore(value: 2)
     
     init() {
         // Create a temporary directory for output
@@ -53,6 +59,8 @@ final class FFmpegService {
     func analyzeVideoFile(_ url: URL) async throws -> VideoInfo {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<VideoInfo, Error>) in
             encodeQueue.async {
+                self.encodeSemaphore.wait()
+                defer { self.encodeSemaphore.signal() }
                 do {
                     let result = try self.analyzeVideoFileSync(url)
                     continuation.resume(returning: result)
@@ -91,6 +99,7 @@ final class FFmpegService {
         var hasAudio = false
         var needsAudioConversion = false
         var isHEVC = false
+        var hevcCodecString: String? = nil
         
         for i in 0..<nbStreams {
             let stream = inputCtx!.pointee.streams[i]!
@@ -103,6 +112,65 @@ final class FFmpegService {
                 isHEVC = codecpar.codec_id == AV_CODEC_ID_HEVC
                 if let desc = avcodec_descriptor_get(codecpar.codec_id) {
                     videoCodecName = String(cString: desc.pointee.name)
+                }
+                // Parse HEVCDecoderConfigurationRecord from extradata to build
+                // the correct CODECS string for HLS master playlist.
+                // Format: hvc1.<profile>.<compat_hex>.<tier><level>.<constraints>
+                if isHEVC, codecpar.extradata != nil, codecpar.extradata_size >= 13 {
+                    let extra = codecpar.extradata!
+                    let configVersion = extra[0]
+                    if configVersion == 1 {
+                        let byte1 = extra[1]
+                        let profileSpace = (byte1 >> 6) & 0x03
+                        let tierFlag = (byte1 >> 5) & 0x01
+                        let profileIDC = byte1 & 0x1F
+                        
+                        // Profile compatibility flags (4 bytes, big-endian)
+                        let compatFlags: UInt32 = (UInt32(extra[2]) << 24) | (UInt32(extra[3]) << 16) |
+                                                  (UInt32(extra[4]) << 8) | UInt32(extra[5])
+                        // Reverse the bit order of compatFlags for the CODECS string
+                        var reversed: UInt32 = 0
+                        var cf = compatFlags
+                        for _ in 0..<32 {
+                            reversed = (reversed << 1) | (cf & 1)
+                            cf >>= 1
+                        }
+                        
+                        // Constraint indicator flags (6 bytes)
+                        let constraints = (0..<6).map { extra[6 + $0] }
+                        
+                        let levelIDC = extra[12]
+                        
+                        // Build profile prefix
+                        let profilePrefix: String
+                        switch profileSpace {
+                        case 1: profilePrefix = "A"
+                        case 2: profilePrefix = "B"
+                        case 3: profilePrefix = "C"
+                        default: profilePrefix = ""
+                        }
+                        
+                        let tierChar = tierFlag == 1 ? "H" : "L"
+                        
+                        // Build constraint string: bytes as hex, trim trailing zeros
+                        var constraintStr = ""
+                        var lastNonZero = -1
+                        for j in stride(from: 5, through: 0, by: -1) {
+                            if constraints[j] != 0 {
+                                lastNonZero = j
+                                break
+                            }
+                        }
+                        if lastNonZero >= 0 {
+                            constraintStr = "." + (0...lastNonZero).map { String(format: "%02X", constraints[$0]) }.joined(separator: ".")
+                        }
+                        
+                        hevcCodecString = "hvc1.\(profilePrefix)\(profileIDC).\(String(format: "%X", reversed)).\(tierChar)\(levelIDC)\(constraintStr)"
+                        print("HEVC codec string from extradata: \(hevcCodecString!)")
+                        print("  configVersion=\(configVersion) profileSpace=\(profileSpace) tier=\(tierFlag) profileIDC=\(profileIDC)")
+                        print("  compatFlags=0x\(String(format: "%08X", compatFlags)) reversed=0x\(String(format: "%08X", reversed))")
+                        print("  levelIDC=\(levelIDC) constraints=\(constraints.map { String(format: "%02X", $0) }.joined(separator: " "))")
+                    }
                 }
             } else if codecpar.codec_type == AVMEDIA_TYPE_AUDIO && !hasAudio {
                 hasAudio = true
@@ -147,7 +215,8 @@ final class FFmpegService {
             audioCodec: audioCodecName,
             needsConversion: nonNativeContainer || needsAudioConversion,
             needsAudioConversion: needsAudioConversion,
-            isHEVC: isHEVC
+            isHEVC: isHEVC,
+            hevcCodecString: hevcCodecString
         )
     }
 
@@ -208,28 +277,20 @@ final class FFmpegService {
         
         // --- Write variant playlist (video.m3u8) with segment entries ---
         // IMPORTANT: No leading whitespace — M3U8 tags must start at column 0
-        let segExt = videoInfo.segmentExtension  // "mp4" for HEVC, "ts" for H.264
+        // Always use MPEG-TS segments (.ts) for both H.264 and HEVC.
+        // HEVC in MPEG-TS works with AVPlayer on iOS 11+ and avoids all fMP4
+        // complexities that cause AirPlay rejection.
         
         var variant = "#EXTM3U\n"
-        if videoInfo.isHEVC {
-            // HEVC in HLS requires fMP4 segments with version 7+
-            variant += "#EXT-X-VERSION:7\n"
-        } else {
-            variant += "#EXT-X-VERSION:3\n"
-        }
+        variant += "#EXT-X-VERSION:3\n"
         variant += "#EXT-X-TARGETDURATION:11\n"
         variant += "#EXT-X-MEDIA-SEQUENCE:0\n"
         variant += "#EXT-X-PLAYLIST-TYPE:VOD\n"
         
-        if videoInfo.isHEVC {
-            // fMP4 requires an initialization segment (moov atom)
-            variant += "#EXT-X-MAP:URI=\"init.mp4\"\n"
-        }
-        
         for i in 0..<totalSegments {
             let duration = min(segmentDuration, videoInfo.durationInSeconds - Double(i) * segmentDuration)
             variant += "#EXTINF:\(String(format: "%.3f", duration)),\n"
-            variant += "segment_\(String(format: "%03d", i)).\(segExt)\n"
+            variant += "segment_\(String(format: "%03d", i)).ts\n"
         }
         
         variant += "#EXT-X-ENDLIST\n"
@@ -252,11 +313,7 @@ final class FFmpegService {
     func buildMasterPlaylist(videoInfo: VideoInfo, subtitleTracks: [SubtitleTrack] = []) -> String {
         // IMPORTANT: No leading whitespace — M3U8 tags must start at column 0
         var master = "#EXTM3U\n"
-        if videoInfo.isHEVC {
-            master += "#EXT-X-VERSION:7\n"
-        } else {
-            master += "#EXT-X-VERSION:3\n"
-        }
+        master += "#EXT-X-VERSION:3\n"
         
         // Add subtitle media entries
         let hasSubtitles = !subtitleTracks.isEmpty
@@ -269,24 +326,15 @@ final class FFmpegService {
         }
         
         // Stream info line — reference the variant playlist
-        let bandwidth = 4_000_000  // Approximate bitrate matching our -b:v 4000k
+        let bandwidth = 4_000_000  // Approximate bitrate
         let width = Int(videoInfo.size.width)
         let height = Int(videoInfo.size.height)
         
-        // CODECS attribute: required for HEVC so AirPlay receivers know the codec.
-        // hvc1.2.4.L153.B0 = HEVC Main 10 Profile, Level 5.1 (conservative, widely compatible)
-        // mp4a.40.2 = AAC-LC
-        let codecsAttr: String
-        if videoInfo.isHEVC {
-            codecsAttr = ",CODECS=\"hvc1.2.4.L153.B0,mp4a.40.2\""
-        } else {
-            codecsAttr = ""
-        }
-        
+        // No CODECS attribute needed for MPEG-TS — AVPlayer auto-detects from the stream.
         if hasSubtitles {
-            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height)\(codecsAttr),SUBTITLES=\"subs\"\n"
+            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height),SUBTITLES=\"subs\"\n"
         } else {
-            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height)\(codecsAttr)\n"
+            master += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),RESOLUTION=\(width)x\(height)\n"
         }
         master += "video.m3u8\n"
         
@@ -446,13 +494,13 @@ final class FFmpegService {
     ///
     /// Strategy:
     /// 1. For H.264/HEVC sources: use FFmpeg C API to **remux** directly into
-    ///    MPEG-TS (H.264) or fMP4 (HEVC) without re-encoding.
+    ///    MPEG-TS without re-encoding. HEVC in MPEG-TS works with AVPlayer/AirPlay
+    ///    on iOS 11+ and avoids fMP4 formatting issues.
     /// 2. For other sources: fall back to mpv encode mode.
     ///
     /// Handles concurrent requests for the same segment by queuing waiters.
     func generateSegment(from sourceURL: URL, segmentIndex: Int, segmentDuration: Double = 10.0) async throws -> URL {
-        let ext = sourceIsHEVC ? "mp4" : "ts"
-        let segmentPath = outputDirectory.appendingPathComponent("segment_\(String(format: "%03d", segmentIndex)).\(ext)")
+        let segmentPath = outputDirectory.appendingPathComponent("segment_\(String(format: "%03d", segmentIndex)).ts")
         
         // Check if segment already exists (cached)
         if FileManager.default.fileExists(atPath: segmentPath.path) {
@@ -485,7 +533,7 @@ final class FFmpegService {
                     startTime: startTime,
                     duration: segmentDuration
                 )
-                print("Segment \(segmentIndex) remuxed via FFmpeg (no re-encode)")
+                print("Segment \(segmentIndex) generated via FFmpeg C API")
             } catch {
                 print("Segment \(segmentIndex): FFmpeg remux failed (\(error)), trying mpv encode...")
                 try? FileManager.default.removeItem(at: segmentPath)
@@ -623,12 +671,458 @@ final class FFmpegService {
             let initData = data.subdata(in: 0..<start)
             try initData.write(to: URL(fileURLWithPath: initPath))
             print("stripFtypMoov: saved init segment (\(start) bytes) to \(initPath)")
+            dumpMP4Boxes(at: initPath, label: "INIT SEGMENT")
         }
         
         // Rewrite the file starting from the moof atom
         let trimmedData = data.subdata(in: start..<count)
-        try trimmedData.write(to: URL(fileURLWithPath: path))
-        print("stripFtypMoov: stripped \(start) bytes (ftyp+moov) from segment, \(count) -> \(trimmedData.count) bytes")
+        
+        // Also strip trailing 'mfra' (Movie Fragment Random Access) box if present.
+        // FFmpeg's av_write_trailer writes mfra for seekable fMP4, but it's not
+        // valid in HLS fMP4 segments and may confuse AirPlay receivers.
+        var endOffset = trimmedData.count
+        if endOffset > 8 {
+            // Check if the last atom is mfra by scanning backwards
+            // Look at the last atom: mfra has an mfro (Movie Fragment Random Access Offset)
+            // box at the very end with a pointer to the mfra start.
+            // Simpler: scan forward to find and exclude any trailing mfra.
+            var scanPos = 0
+            var lastMoofMdatEnd = 0
+            while scanPos + 8 <= endOffset {
+                let aSize: Int = trimmedData.withUnsafeBytes { bytes in
+                    let ptr = bytes.baseAddress!.advanced(by: scanPos).assumingMemoryBound(to: UInt8.self)
+                    return (Int(ptr[0]) << 24) | (Int(ptr[1]) << 16) | (Int(ptr[2]) << 8) | Int(ptr[3])
+                }
+                let aType: String = trimmedData.withUnsafeBytes { bytes in
+                    let ptr = bytes.baseAddress!.advanced(by: scanPos + 4).assumingMemoryBound(to: UInt8.self)
+                    return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+                }
+                guard aSize >= 8 else { break }
+                if aType == "mfra" {
+                    endOffset = scanPos
+                    print("stripFtypMoov: also stripped trailing mfra (\(aSize) bytes)")
+                    break
+                }
+                scanPos += aSize
+            }
+        }
+        
+        let strippedData = endOffset < trimmedData.count ? trimmedData.subdata(in: 0..<endOffset) : trimmedData
+        
+        // Prepend an 'styp' (Segment Type) box before the moof.
+        // Apple's HLS fMP4 spec and CMAF (ISO 23000-19) require media segments
+        // to begin with a 'styp' box. Some AirPlay receivers reject segments
+        // that start directly with 'moof'.
+        // styp box: size(4) + 'styp'(4) + major_brand(4) + minor_version(4) + compatible_brands(...)
+        var stypBox = Data()
+        let stypSize: UInt32 = 24  // 8 (header) + 4 (major) + 4 (minor) + 8 (2 compatible brands)
+        withUnsafeBytes(of: stypSize.bigEndian) { stypBox.append(contentsOf: $0) }
+        stypBox.append(contentsOf: [0x73, 0x74, 0x79, 0x70])  // 'styp'
+        stypBox.append(contentsOf: [0x6D, 0x73, 0x64, 0x68])  // major_brand: 'msdh'
+        withUnsafeBytes(of: UInt32(0).bigEndian) { stypBox.append(contentsOf: $0) }  // minor_version: 0
+        stypBox.append(contentsOf: [0x6D, 0x73, 0x64, 0x68])  // compatible: 'msdh'
+        stypBox.append(contentsOf: [0x6D, 0x73, 0x69, 0x78])  // compatible: 'msix'
+        
+        var finalData = Data()
+        finalData.reserveCapacity(stypBox.count + strippedData.count)
+        finalData.append(stypBox)
+        finalData.append(strippedData)
+        
+        try finalData.write(to: URL(fileURLWithPath: path))
+        print("stripFtypMoov: stripped \(start) bytes (ftyp+moov), prepended styp (\(stypBox.count) bytes), \(count) -> \(finalData.count) bytes")
+        dumpMP4Boxes(at: path, label: "MEDIA SEGMENT")
+    }
+    
+    /// Dumps top-level MP4 box structure of a file for debugging.
+    /// Recursively descends into container boxes (moov, trak, mdia, moof, traf).
+    private static func dumpMP4Boxes(at path: String, label: String) {
+        guard let data = FileManager.default.contents(atPath: path) else {
+            print("\(label): cannot read file")
+            return
+        }
+        print("\(label): \(data.count) bytes, box structure:")
+        dumpBoxes(data: data, offset: 0, end: data.count, indent: "  ")
+        
+        // For init segments, also do a hex dump of the first 256 bytes after moov
+        // to inspect hvcC and colr sub-boxes inside hvc1 sample entry
+        if label.contains("INIT") {
+            // Find stsd box and dump its contents
+            let stsdOffset = findBoxOffset(data: data, type: "stsd")
+            if let stsdOff = stsdOffset {
+                let stsdSize = data.withUnsafeBytes { bytes -> Int in
+                    let ptr = bytes.baseAddress!.advanced(by: stsdOff).assumingMemoryBound(to: UInt8.self)
+                    return (Int(ptr[0]) << 24) | (Int(ptr[1]) << 16) | (Int(ptr[2]) << 8) | Int(ptr[3])
+                }
+                print("\(label) stsd at offset \(stsdOff), size \(stsdSize)")
+                // Dump first entry header (at stsdOff + 16: after 8 box header + 4 version/flags + 4 entry_count)
+                let entryStart = stsdOff + 16
+                let entryEnd = min(stsdOff + stsdSize, data.count)
+                if entryStart + 8 <= entryEnd {
+                    let entrySize = data.withUnsafeBytes { bytes -> Int in
+                        let ptr = bytes.baseAddress!.advanced(by: entryStart).assumingMemoryBound(to: UInt8.self)
+                        return (Int(ptr[0]) << 24) | (Int(ptr[1]) << 16) | (Int(ptr[2]) << 8) | Int(ptr[3])
+                    }
+                    let entryType = data.withUnsafeBytes { bytes -> String in
+                        let ptr = bytes.baseAddress!.advanced(by: entryStart + 4).assumingMemoryBound(to: UInt8.self)
+                        return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+                    }
+                    print("  Entry: [\(entryType)] size=\(entrySize)")
+                    
+                    // For hvc1/hev1, dump sub-boxes starting at entry + 86
+                    if entryType == "hvc1" || entryType == "hev1" {
+                        let subBoxStart = entryStart + 86
+                        let subBoxEnd = min(entryStart + entrySize, entryEnd)
+                        print("  Sub-boxes start at offset \(subBoxStart), end at \(subBoxEnd) (\(subBoxEnd - subBoxStart) bytes available)")
+                        
+                        // Dump sub-box headers
+                        var subPos = subBoxStart
+                        while subPos + 8 <= subBoxEnd {
+                            let subSize = data.withUnsafeBytes { bytes -> Int in
+                                let ptr = bytes.baseAddress!.advanced(by: subPos).assumingMemoryBound(to: UInt8.self)
+                                return (Int(ptr[0]) << 24) | (Int(ptr[1]) << 16) | (Int(ptr[2]) << 8) | Int(ptr[3])
+                            }
+                            let subType = data.withUnsafeBytes { bytes -> String in
+                                let ptr = bytes.baseAddress!.advanced(by: subPos + 4).assumingMemoryBound(to: UInt8.self)
+                                return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+                            }
+                            // Hex dump first 32 bytes of sub-box content
+                            let contentStart = subPos + 8
+                            let contentEnd = min(subPos + subSize, subBoxEnd)
+                            let hexLen = min(32, contentEnd - contentStart)
+                            var hexStr = ""
+                            if hexLen > 0 {
+                                hexStr = data.withUnsafeBytes { bytes -> String in
+                                    let ptr = bytes.baseAddress!.advanced(by: contentStart).assumingMemoryBound(to: UInt8.self)
+                                    return (0..<hexLen).map { String(format: "%02X", ptr[$0]) }.joined(separator: " ")
+                                }
+                            }
+                            print("    [\(subType)] size=\(subSize) hex: \(hexStr)")
+                            
+                            if subSize < 8 { break }
+                            subPos += subSize
+                        }
+                        
+                        // Also hex dump the first 16 bytes at subBoxStart to verify alignment
+                        if subBoxStart + 16 <= data.count {
+                            let rawHex = data.withUnsafeBytes { bytes -> String in
+                                let ptr = bytes.baseAddress!.advanced(by: subBoxStart).assumingMemoryBound(to: UInt8.self)
+                                return (0..<min(16, subBoxEnd - subBoxStart)).map { String(format: "%02X", ptr[$0]) }.joined(separator: " ")
+                            }
+                            print("  Raw bytes at sub-box start (\(subBoxStart)): \(rawHex)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Find the absolute offset of a box type by scanning recursively through MP4 structure.
+    private static func findBoxOffset(data: Data, type: String) -> Int? {
+        return findBoxOffsetRecursive(data: data, type: type, start: 0, end: data.count)
+    }
+    
+    private static func findBoxOffsetRecursive(data: Data, type: String, start: Int, end: Int) -> Int? {
+        let containerTypes: Set<String> = ["moov", "trak", "mdia", "minf", "stbl", "moof", "traf", "mvex"]
+        var pos = start
+        while pos + 8 <= end {
+            let boxSize = data.withUnsafeBytes { bytes -> Int in
+                let ptr = bytes.baseAddress!.advanced(by: pos).assumingMemoryBound(to: UInt8.self)
+                return (Int(ptr[0]) << 24) | (Int(ptr[1]) << 16) | (Int(ptr[2]) << 8) | Int(ptr[3])
+            }
+            let boxType = data.withUnsafeBytes { bytes -> String in
+                let ptr = bytes.baseAddress!.advanced(by: pos + 4).assumingMemoryBound(to: UInt8.self)
+                return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+            }
+            let actualSize = boxSize == 0 ? (end - pos) : boxSize
+            guard actualSize >= 8 else { break }
+            
+            if boxType == type { return pos }
+            if containerTypes.contains(boxType) {
+                let childStart = pos + 8 + (boxType == "stsd" ? 8 : 0)
+                if let found = findBoxOffsetRecursive(data: data, type: type, start: childStart, end: min(pos + actualSize, end)) {
+                    return found
+                }
+            }
+            pos += actualSize
+        }
+        return nil
+    }
+    
+    private static func dumpBoxes(data: Data, offset: Int, end: Int, indent: String) {
+        let containerTypes: Set<String> = ["moov", "trak", "mdia", "minf", "stbl", "moof", "traf", "mvex"]
+        let videoSampleEntries: Set<String> = ["hvc1", "hev1", "avc1", "avc3"]
+        let audioSampleEntries: Set<String> = ["mp4a"]
+        var pos = offset
+        while pos + 8 <= end {
+            let boxSize: Int = data.withUnsafeBytes { bytes in
+                let ptr = bytes.baseAddress!.advanced(by: pos).assumingMemoryBound(to: UInt8.self)
+                return (Int(ptr[0]) << 24) | (Int(ptr[1]) << 16) | (Int(ptr[2]) << 8) | Int(ptr[3])
+            }
+            let boxType: String = data.withUnsafeBytes { bytes in
+                let ptr = bytes.baseAddress!.advanced(by: pos + 4).assumingMemoryBound(to: UInt8.self)
+                return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+            }
+            
+            let actualSize: Int
+            if boxSize == 1 && pos + 16 <= end {
+                // 64-bit extended size
+                actualSize = data.withUnsafeBytes { bytes in
+                    let ptr = bytes.baseAddress!.advanced(by: pos + 8).assumingMemoryBound(to: UInt8.self)
+                    var s: Int = 0
+                    for j in 0..<8 { s = (s << 8) | Int(ptr[j]) }
+                    return s
+                }
+            } else if boxSize == 0 {
+                actualSize = end - pos  // box extends to end of file
+            } else {
+                actualSize = boxSize
+            }
+            
+            guard actualSize >= 8 else {
+                print("\(indent)[\(boxType)] INVALID size=\(actualSize) at offset \(pos)")
+                break
+            }
+            
+            // Extra info for specific box types
+            var extra = ""
+            if (boxType == "ftyp" || boxType == "styp") && actualSize >= 16 {
+                // File/Segment type: major_brand(4) + minor_version(4) + compatible_brands(...)
+                let majorBrand: String = data.withUnsafeBytes { bytes in
+                    let ptr = bytes.baseAddress!.advanced(by: pos + 8).assumingMemoryBound(to: UInt8.self)
+                    return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+                }
+                var brands = [majorBrand]
+                var bPos = pos + 16
+                while bPos + 4 <= pos + actualSize {
+                    let brand: String = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: bPos).assumingMemoryBound(to: UInt8.self)
+                        return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+                    }
+                    brands.append(brand)
+                    bPos += 4
+                }
+                extra = " brands=[\(brands.joined(separator: ","))]"
+            } else if boxType == "tkhd" && pos + 24 <= end && actualSize >= 24 {
+                // Track header: version(1) + flags(3) + ... track_ID at offset 12 (v0) or 20 (v1)
+                let version = data.withUnsafeBytes { bytes -> UInt8 in
+                    bytes.baseAddress!.advanced(by: pos + 8).assumingMemoryBound(to: UInt8.self).pointee
+                }
+                let tkhdOffset = version == 0 ? (pos + 20) : (pos + 28)
+                if tkhdOffset + 4 <= end {
+                    let trackId: UInt32 = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: tkhdOffset).assumingMemoryBound(to: UInt8.self)
+                        return (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                    }
+                    extra = " track_id=\(trackId)"
+                }
+            } else if boxType == "tfhd" && pos + 12 <= end {
+                // Track fragment header: version(1) + flags(3) + track_ID(4)
+                let tfhdFlags: UInt32 = data.withUnsafeBytes { bytes in
+                    let ptr = bytes.baseAddress!.advanced(by: pos + 8).assumingMemoryBound(to: UInt8.self)
+                    // flags are bytes 1-3 of version+flags field (byte 0 is version)
+                    return (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                }
+                let trackId: UInt32 = data.withUnsafeBytes { bytes in
+                    let ptr = bytes.baseAddress!.advanced(by: pos + 12).assumingMemoryBound(to: UInt8.self)
+                    return (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                }
+                let defaultBaseMoof = (tfhdFlags & 0x020000) != 0
+                extra = " track_id=\(trackId) flags=0x\(String(tfhdFlags, radix: 16)) default_base_moof=\(defaultBaseMoof)"
+            } else if boxType == "trun" && pos + 12 <= end {
+                // Track run: version(1) + flags(3) + sample_count(4) [+ data_offset(4)]
+                let trunVersion: UInt8 = data.withUnsafeBytes { bytes in
+                    bytes.baseAddress!.advanced(by: pos + 8).assumingMemoryBound(to: UInt8.self).pointee
+                }
+                let trunFlags: UInt32 = data.withUnsafeBytes { bytes in
+                    let ptr = bytes.baseAddress!.advanced(by: pos + 8).assumingMemoryBound(to: UInt8.self)
+                    return (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                }
+                let sampleCount: UInt32 = data.withUnsafeBytes { bytes in
+                    let ptr = bytes.baseAddress!.advanced(by: pos + 12).assumingMemoryBound(to: UInt8.self)
+                    return (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                }
+                var dataOffsetStr = ""
+                if (trunFlags & 0x1) != 0 && pos + 20 <= end {
+                    // data_offset_present flag
+                    let dataOffset: Int32 = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: pos + 16).assumingMemoryBound(to: UInt8.self)
+                        let raw = (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                        return Int32(bitPattern: raw)
+                    }
+                    dataOffsetStr = " data_offset=\(dataOffset)"
+                }
+                extra = " v=\(trunVersion) flags=0x\(String(trunFlags, radix: 16)) samples=\(sampleCount)\(dataOffsetStr)"
+            } else if boxType == "hdlr" && actualSize >= 20 {
+                // Handler reference: version(1) + flags(3) + pre_defined(4) + handler_type(4)
+                let htOffset = pos + 16
+                if htOffset + 4 <= end {
+                    let handlerType: String = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: htOffset).assumingMemoryBound(to: UInt8.self)
+                        return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+                    }
+                    extra = " handler=\(handlerType)"
+                }
+            } else if boxType == "stsd" && actualSize >= 16 {
+                // Sample description: version(1) + flags(3) + entry_count(4) + first entry type(4)
+                let entryTypeOffset = pos + 20
+                if entryTypeOffset + 4 <= end {
+                    let entryType: String = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: entryTypeOffset).assumingMemoryBound(to: UInt8.self)
+                        return String(bytes: [ptr[0], ptr[1], ptr[2], ptr[3]], encoding: .ascii) ?? "????"
+                    }
+                    extra = " codec=\(entryType)"
+                }
+            } else if boxType == "hvcC" && actualSize >= 21 {
+                // HEVCDecoderConfigurationRecord:
+                // offset 8: configurationVersion(1) + general_profile_space/tier/idc(1) +
+                //           profile_compatibility_flags(4) + constraint_indicator_flags(6) + general_level_idc(1)
+                let hvcCBase = pos + 8
+                if hvcCBase + 13 <= end {
+                    let configVer = data.withUnsafeBytes { bytes -> UInt8 in
+                        bytes.baseAddress!.advanced(by: hvcCBase).assumingMemoryBound(to: UInt8.self).pointee
+                    }
+                    let byte1 = data.withUnsafeBytes { bytes -> UInt8 in
+                        bytes.baseAddress!.advanced(by: hvcCBase + 1).assumingMemoryBound(to: UInt8.self).pointee
+                    }
+                    let profileSpace = (byte1 >> 6) & 0x03
+                    let tierFlag = (byte1 >> 5) & 0x01
+                    let profileIDC = byte1 & 0x1F
+                    let compatFlags: UInt32 = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: hvcCBase + 2).assumingMemoryBound(to: UInt8.self)
+                        return (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                    }
+                    let levelIDC = data.withUnsafeBytes { bytes -> UInt8 in
+                        bytes.baseAddress!.advanced(by: hvcCBase + 12).assumingMemoryBound(to: UInt8.self).pointee
+                    }
+                    let constraints = (0..<6).map { i -> UInt8 in
+                        data.withUnsafeBytes { bytes -> UInt8 in
+                            bytes.baseAddress!.advanced(by: hvcCBase + 6 + i).assumingMemoryBound(to: UInt8.self).pointee
+                        }
+                    }
+                    let tierStr = tierFlag == 1 ? "High" : "Main"
+                    extra = " v=\(configVer) space=\(profileSpace) tier=\(tierStr) profile=\(profileIDC) level=\(levelIDC) compat=0x\(String(format: "%08X", compatFlags)) constraints=\(constraints.map { String(format: "%02X", $0) }.joined(separator: "."))"
+                    
+                    // Also parse NAL unit length size
+                    if hvcCBase + 22 <= end {
+                        let nalLenByte = data.withUnsafeBytes { bytes -> UInt8 in
+                            bytes.baseAddress!.advanced(by: hvcCBase + 14 + 7).assumingMemoryBound(to: UInt8.self).pointee
+                        }
+                        let nalLenSize = (nalLenByte & 0x03) + 1
+                        extra += " nalLenSize=\(nalLenSize)"
+                    }
+                }
+            } else if boxType == "colr" && actualSize >= 12 {
+                // Color information box
+                let colrBase = pos + 8
+                if colrBase + 4 <= end {
+                    let colorType = (0..<4).map { i -> UInt8 in
+                        data.withUnsafeBytes { bytes -> UInt8 in
+                            bytes.baseAddress!.advanced(by: colrBase + i).assumingMemoryBound(to: UInt8.self).pointee
+                        }
+                    }
+                    let colorTypeStr = String(bytes: colorType, encoding: .ascii) ?? "????"
+                    if colorTypeStr == "nclx" && colrBase + 11 <= end {
+                        // nclx: primaries(2) + transfer(2) + matrix(2) + full_range(1)
+                        let primaries: UInt16 = data.withUnsafeBytes { bytes in
+                            let ptr = bytes.baseAddress!.advanced(by: colrBase + 4).assumingMemoryBound(to: UInt8.self)
+                            return (UInt16(ptr[0]) << 8) | UInt16(ptr[1])
+                        }
+                        let transfer: UInt16 = data.withUnsafeBytes { bytes in
+                            let ptr = bytes.baseAddress!.advanced(by: colrBase + 6).assumingMemoryBound(to: UInt8.self)
+                            return (UInt16(ptr[0]) << 8) | UInt16(ptr[1])
+                        }
+                        let matrix: UInt16 = data.withUnsafeBytes { bytes in
+                            let ptr = bytes.baseAddress!.advanced(by: colrBase + 8).assumingMemoryBound(to: UInt8.self)
+                            return (UInt16(ptr[0]) << 8) | UInt16(ptr[1])
+                        }
+                        let fullRange = data.withUnsafeBytes { bytes -> UInt8 in
+                            bytes.baseAddress!.advanced(by: colrBase + 10).assumingMemoryBound(to: UInt8.self).pointee
+                        }
+                        extra = " type=nclx primaries=\(primaries) transfer=\(transfer) matrix=\(matrix) fullRange=\(fullRange & 0x80 != 0 ? "yes" : "no")"
+                    } else if colorTypeStr == "nclc" && colrBase + 10 <= end {
+                        // nclc (Apple variant): primaries(2) + transfer(2) + matrix(2)
+                        let primaries: UInt16 = data.withUnsafeBytes { bytes in
+                            let ptr = bytes.baseAddress!.advanced(by: colrBase + 4).assumingMemoryBound(to: UInt8.self)
+                            return (UInt16(ptr[0]) << 8) | UInt16(ptr[1])
+                        }
+                        let transfer: UInt16 = data.withUnsafeBytes { bytes in
+                            let ptr = bytes.baseAddress!.advanced(by: colrBase + 6).assumingMemoryBound(to: UInt8.self)
+                            return (UInt16(ptr[0]) << 8) | UInt16(ptr[1])
+                        }
+                        let matrix: UInt16 = data.withUnsafeBytes { bytes in
+                            let ptr = bytes.baseAddress!.advanced(by: colrBase + 8).assumingMemoryBound(to: UInt8.self)
+                            return (UInt16(ptr[0]) << 8) | UInt16(ptr[1])
+                        }
+                        extra = " type=nclc primaries=\(primaries) transfer=\(transfer) matrix=\(matrix)"
+                    } else {
+                        extra = " type=\(colorTypeStr)"
+                    }
+                }
+            } else if boxType == "pasp" && actualSize >= 16 {
+                // Pixel aspect ratio box: hSpacing(4) + vSpacing(4)
+                let paspBase = pos + 8
+                if paspBase + 8 <= end {
+                    let hSpacing: UInt32 = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: paspBase).assumingMemoryBound(to: UInt8.self)
+                        return (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                    }
+                    let vSpacing: UInt32 = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: paspBase + 4).assumingMemoryBound(to: UInt8.self)
+                        return (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                    }
+                    extra = " hSpacing=\(hSpacing) vSpacing=\(vSpacing)"
+                }
+            } else if boxType == "mdhd" && actualSize >= 20 {
+                // Media header box: version(1) + flags(3) + timestamps + timescale
+                let mdhdBase = pos + 8
+                let version = data.withUnsafeBytes { bytes -> UInt8 in
+                    bytes.baseAddress!.advanced(by: mdhdBase).assumingMemoryBound(to: UInt8.self).pointee
+                }
+                let timescaleOffset = mdhdBase + (version == 0 ? 12 : 20)
+                if timescaleOffset + 4 <= end {
+                    let timescale: UInt32 = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: timescaleOffset).assumingMemoryBound(to: UInt8.self)
+                        return (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                    }
+                    extra = " v=\(version) timescale=\(timescale)"
+                }
+            } else if boxType == "tfdt" && actualSize >= 16 {
+                // Track Fragment Decode Time: version(1) + flags(3) + baseMediaDecodeTime
+                let version = data.withUnsafeBytes { bytes -> UInt8 in
+                    bytes.baseAddress!.advanced(by: pos + 8).assumingMemoryBound(to: UInt8.self).pointee
+                }
+                if version == 0 && pos + 16 <= end {
+                    let bmdt: UInt32 = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: pos + 12).assumingMemoryBound(to: UInt8.self)
+                        return (UInt32(ptr[0]) << 24) | (UInt32(ptr[1]) << 16) | (UInt32(ptr[2]) << 8) | UInt32(ptr[3])
+                    }
+                    extra = " baseMediaDecodeTime=\(bmdt)"
+                } else if version == 1 && pos + 20 <= end {
+                    let bmdt: UInt64 = data.withUnsafeBytes { bytes in
+                        let ptr = bytes.baseAddress!.advanced(by: pos + 12).assumingMemoryBound(to: UInt8.self)
+                        var val: UInt64 = 0
+                        for j in 0..<8 { val = (val << 8) | UInt64(ptr[j]) }
+                        return val
+                    }
+                    extra = " baseMediaDecodeTime=\(bmdt)"
+                }
+            }
+            
+            print("\(indent)[\(boxType)] size=\(actualSize)\(extra)")
+            
+            if containerTypes.contains(boxType) {
+                let childStart = pos + 8 + (boxType == "stsd" ? 8 : 0)
+                dumpBoxes(data: data, offset: childStart, end: min(pos + actualSize, end), indent: indent + "  ")
+            } else if videoSampleEntries.contains(boxType) && actualSize > 86 {
+                // Video sample entry (hvc1, hev1, avc1, etc.): 8 (header) + 6 (reserved) + 2 (data_ref_idx) + 70 (video fields) = 86 bytes fixed
+                dumpBoxes(data: data, offset: pos + 86, end: min(pos + actualSize, end), indent: indent + "  ")
+            } else if audioSampleEntries.contains(boxType) && actualSize > 36 {
+                // Audio sample entry (mp4a): 8 (header) + 6 (reserved) + 2 (data_ref_idx) + 20 (audio fields) = 36 bytes fixed
+                dumpBoxes(data: data, offset: pos + 36, end: min(pos + actualSize, end), indent: indent + "  ")
+            }
+            
+            pos += actualSize
+        }
     }
     
     /// Converts an FFmpeg error code to a human-readable string.
@@ -639,13 +1133,10 @@ final class FFmpegService {
     }
     
     /// Remuxes a time range from the source video into an MPEG-TS segment
-    /// using the FFmpeg C API (Libavformat). No re-encoding — the H.264 and AAC
-    /// bitstreams are copied directly into a proper MPEG-TS container.
+    /// using the FFmpeg C API (Libavformat). For H.264, bitstreams are copied directly.
+    /// For HEVC, video is transcoded to H.264 via VideoToolbox for AirPlay compatibility.
     ///
-    /// This produces real `.ts` segments that AirPlay receivers expect,
-    /// unlike fMP4 segments which cause init/media segment mismatch errors.
-    ///
-    /// Runs on `encodeQueue` to serialize FFmpeg operations.
+    /// Runs on concurrent `encodeQueue`, bounded by `encodeSemaphore`.
     private func remuxSegmentWithFFmpeg(
         from sourceURL: URL,
         to outputURL: URL,
@@ -654,6 +1145,8 @@ final class FFmpegService {
     ) async throws -> URL {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             self.encodeQueue.async {
+                self.encodeSemaphore.wait()
+                defer { self.encodeSemaphore.signal() }
                 do {
                     let result = try self.remuxSegmentWithFFmpegSync(
                         from: sourceURL,
@@ -671,7 +1164,7 @@ final class FFmpegService {
     
     /// Synchronous FFmpeg remux implementation. Must be called on `encodeQueue`.
     ///
-    /// For video: always copies (remuxes) — no re-encoding.
+    /// For video: copies if H.264, transcodes HEVC→H.264 via VideoToolbox for AirPlay compatibility.
     /// For audio: copies if the codec is MPEG-TS compatible (AAC, AC3, EAC3, MP3, MP2),
     ///            otherwise transcodes to AAC (needed for MKV files with Opus/FLAC/Vorbis).
     private func remuxSegmentWithFFmpegSync(
@@ -699,19 +1192,23 @@ final class FFmpegService {
             throw FFmpegError.conversionFailed("avformat_find_stream_info failed: \(Self.ffmpegErrorString(ret))")
         }
         
-        // --- Allocate output (MPEG-TS or fMP4 depending on video codec) ---
-        // Detect HEVC to decide output format
+        // --- Allocate output (always MPEG-TS) ---
+        // HEVC cannot play video on AirPlay in any container (MPEG-TS = audio only,
+        // fMP4 = rejected with -12848). HEVC video is transcoded to H.264 via
+        // VideoToolbox hardware encoder for AirPlay compatibility.
         var isHEVCSource = false
+        var hevcVideoStreamIdx: Int = -1
         let nbInputStreams = Int(inputCtx!.pointee.nb_streams)
         for i in 0..<nbInputStreams {
             let stream = inputCtx!.pointee.streams[i]!
             if stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO {
                 isHEVCSource = stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+                if isHEVCSource { hevcVideoStreamIdx = i }
                 break
             }
         }
         
-        let outputFormat = isHEVCSource ? "mp4" : "mpegts"
+        let outputFormat = "mpegts"
         
         var outputCtx: UnsafeMutablePointer<AVFormatContext>?
         ret = avformat_alloc_output_context2(&outputCtx, nil, outputFormat, outputPath)
@@ -751,6 +1248,14 @@ final class FFmpegService {
         var audioTranscodeInputIdx: Int = -1
         var audioNextPts: Int64 = 0  // Running PTS counter for AAC encoder output
         
+        // Video transcoding state (for HEVC→H.264, lazily initialized)
+        var videoDecCtx: UnsafeMutablePointer<AVCodecContext>?
+        var videoEncCtx: UnsafeMutablePointer<AVCodecContext>?
+        var swsCtx: UnsafeMutablePointer<SwsContext>?  // SwsContext for pixel format conversion
+        var videoNeedsTranscode = false
+        var videoTranscodeInputIdx: Int = -1
+        var videoNextPts: Int64 = 0  // Running PTS counter for H.264 encoder output
+        
         for i in 0..<inputStreamCount {
             let inputStream = inputCtx!.pointee.streams[i]!
             let codecpar = inputStream.pointee.codecpar.pointee
@@ -764,24 +1269,164 @@ final class FFmpegService {
                     continue
                 }
                 
-                streamMapping[i] = outputStreamIndex
-                outputStreamIndex += 1
-                
-                guard let outStream = avformat_new_stream(outputCtxUnwrapped, nil) else {
-                    throw FFmpegError.conversionFailed("avformat_new_stream failed for stream \(i)")
+                if isHEVCSource && codecpar.codec_id == AV_CODEC_ID_HEVC && videoDecCtx == nil {
+                    // --- Set up HEVC→H.264 video transcode pipeline ---
+                    print("HEVC video detected — setting up VideoToolbox H.264 transcode for AirPlay")
+                    
+                    // Set up HEVC decoder
+                    guard let decoder = avcodec_find_decoder(AV_CODEC_ID_HEVC) else {
+                        print("HEVC decoder not found, falling back to passthrough")
+                        // Fall through to passthrough copy below
+                        streamMapping[i] = outputStreamIndex
+                        outputStreamIndex += 1
+                        guard let outStream = avformat_new_stream(outputCtxUnwrapped, nil) else {
+                            throw FFmpegError.conversionFailed("avformat_new_stream failed for stream \(i)")
+                        }
+                        ret = avcodec_parameters_copy(outStream.pointee.codecpar, inputStream.pointee.codecpar)
+                        guard ret >= 0 else {
+                            throw FFmpegError.conversionFailed("avcodec_parameters_copy failed: \(Self.ffmpegErrorString(ret))")
+                        }
+                        outStream.pointee.codecpar.pointee.codec_tag = 0
+                        continue
+                    }
+                    
+                    guard let decCtx = avcodec_alloc_context3(decoder) else {
+                        throw FFmpegError.conversionFailed("avcodec_alloc_context3 (HEVC decoder) failed")
+                    }
+                    ret = avcodec_parameters_to_context(decCtx, inputStream.pointee.codecpar)
+                    guard ret >= 0 else {
+                        avcodec_free_context(&videoDecCtx)
+                        throw FFmpegError.conversionFailed("avcodec_parameters_to_context (video) failed: \(Self.ffmpegErrorString(ret))")
+                    }
+                    decCtx.pointee.pkt_timebase = inputStream.pointee.time_base
+                    
+                    // Enable multi-threaded HEVC decoding for performance.
+                    // Use frame-level threading with auto thread count (0 = let FFmpeg decide).
+                    decCtx.pointee.thread_count = 4
+                    decCtx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+                    
+                    ret = avcodec_open2(decCtx, decoder, nil)
+                    guard ret >= 0 else {
+                        var dc: UnsafeMutablePointer<AVCodecContext>? = decCtx
+                        avcodec_free_context(&dc)
+                        throw FFmpegError.conversionFailed("avcodec_open2 (HEVC decoder) failed: \(Self.ffmpegErrorString(ret))")
+                    }
+                    videoDecCtx = decCtx
+                    
+                    // Set up H.264 VideoToolbox encoder
+                    guard let encoder = avcodec_find_encoder_by_name("h264_videotoolbox") else {
+                        print("h264_videotoolbox encoder not found! Cannot transcode HEVC for AirPlay.")
+                        var dc: UnsafeMutablePointer<AVCodecContext>? = decCtx
+                        avcodec_free_context(&dc)
+                        videoDecCtx = nil
+                        throw FFmpegError.conversionFailed("h264_videotoolbox encoder not available")
+                    }
+                    
+                    guard let encCtx = avcodec_alloc_context3(encoder) else {
+                        var dc: UnsafeMutablePointer<AVCodecContext>? = decCtx
+                        avcodec_free_context(&dc)
+                        videoDecCtx = nil
+                        throw FFmpegError.conversionFailed("avcodec_alloc_context3 (h264_videotoolbox) failed")
+                    }
+                    
+                    // Configure H.264 encoder to match input resolution
+                    encCtx.pointee.width = decCtx.pointee.width
+                    encCtx.pointee.height = decCtx.pointee.height
+                    encCtx.pointee.sample_aspect_ratio = decCtx.pointee.sample_aspect_ratio
+                    // VideoToolbox encoder expects NV12 or BGRA pixel format
+                    // NV12 is the most efficient for hardware encoding
+                    encCtx.pointee.pix_fmt = AV_PIX_FMT_NV12
+                    // Use the input timebase for consistent timestamps
+                    encCtx.pointee.time_base = inputStream.pointee.time_base
+                    encCtx.pointee.framerate = inputStream.pointee.r_frame_rate
+                    // Set a reasonable bitrate — prioritize encode speed for real-time AirPlay
+                    // VideoToolbox will use hardware rate control
+                    let pixels = Int64(encCtx.pointee.width) * Int64(encCtx.pointee.height)
+                    if pixels >= 1920 * 1080 {
+                        encCtx.pointee.bit_rate = 6_000_000  // 6 Mbps for 1080p
+                    } else if pixels >= 1280 * 720 {
+                        encCtx.pointee.bit_rate = 4_000_000  // 4 Mbps for 720p
+                    } else {
+                        encCtx.pointee.bit_rate = 2_500_000  // 2.5 Mbps for lower res
+                    }
+                    // GOP size — keyframe every 2 seconds for seeking
+                    let fps: Int32
+                    if inputStream.pointee.r_frame_rate.num > 0 && inputStream.pointee.r_frame_rate.den > 0 {
+                        fps = inputStream.pointee.r_frame_rate.num / inputStream.pointee.r_frame_rate.den
+                    } else {
+                        fps = 24
+                    }
+                    encCtx.pointee.gop_size = fps * 2
+                    // Allow B-frames for better compression (VideoToolbox supports this)
+                    encCtx.pointee.max_b_frames = 0  // Start without B-frames for simpler DTS handling
+                    // Set global header flag if required by the muxer
+                    if (outputCtxUnwrapped.pointee.oformat.pointee.flags & AVFMT_GLOBALHEADER) != 0 {
+                        encCtx.pointee.flags |= AV_CODEC_FLAG_GLOBAL_HEADER
+                    }
+                    // Set H.264 profile to Main for good quality + fast encode
+                    encCtx.pointee.profile = 77  // FF_PROFILE_H264_MAIN
+                    encCtx.pointee.level = 41  // Level 4.1 — supports 1080p@30 or 720p@60
+                    
+                    // Open encoder with options
+                    var encOpts: OpaquePointer?  // AVDictionary*
+                    // realtime=1: prioritize encode speed over quality (critical for AirPlay)
+                    av_dict_set(&encOpts, "realtime", "1", 0)
+                    av_dict_set(&encOpts, "allow_sw", "1", 0)  // Allow software fallback
+                    
+                    ret = avcodec_open2(encCtx, encoder, &encOpts)
+                    av_dict_free(&encOpts)
+                    guard ret >= 0 else {
+                        var dc: UnsafeMutablePointer<AVCodecContext>? = decCtx
+                        avcodec_free_context(&dc)
+                        videoDecCtx = nil
+                        var ec: UnsafeMutablePointer<AVCodecContext>? = encCtx
+                        avcodec_free_context(&ec)
+                        throw FFmpegError.conversionFailed("avcodec_open2 (h264_videotoolbox) failed: \(Self.ffmpegErrorString(ret))")
+                    }
+                    videoEncCtx = encCtx
+                    
+                    // Set up SwsContext for pixel format conversion
+                    // HEVC decoder outputs yuv420p/yuv420p10le, VT encoder expects NV12
+                    // We'll set up sws lazily in the decode loop when we know the actual
+                    // decoded pixel format, since HEVC can be 8-bit or 10-bit
+                    
+                    print("H.264 VideoToolbox encoder initialized: \(encCtx.pointee.width)x\(encCtx.pointee.height), \(encCtx.pointee.bit_rate/1000)kbps, GOP=\(encCtx.pointee.gop_size)")
+                    
+                    // Create output stream from encoder parameters
+                    guard let outStream = avformat_new_stream(outputCtxUnwrapped, nil) else {
+                        throw FFmpegError.conversionFailed("avformat_new_stream failed for transcoded video")
+                    }
+                    ret = avcodec_parameters_from_context(outStream.pointee.codecpar, encCtx)
+                    guard ret >= 0 else {
+                        throw FFmpegError.conversionFailed("avcodec_parameters_from_context (video) failed: \(Self.ffmpegErrorString(ret))")
+                    }
+                    outStream.pointee.time_base = encCtx.pointee.time_base
+                    
+                    streamMapping[i] = outputStreamIndex
+                    videoNeedsTranscode = true
+                    videoTranscodeInputIdx = i
+                    outputStreamIndex += 1
+                } else {
+                    // H.264 or non-HEVC: passthrough copy
+                    streamMapping[i] = outputStreamIndex
+                    outputStreamIndex += 1
+                    
+                    guard let outStream = avformat_new_stream(outputCtxUnwrapped, nil) else {
+                        throw FFmpegError.conversionFailed("avformat_new_stream failed for stream \(i)")
+                    }
+                    ret = avcodec_parameters_copy(outStream.pointee.codecpar, inputStream.pointee.codecpar)
+                    guard ret >= 0 else {
+                        throw FFmpegError.conversionFailed("avcodec_parameters_copy failed: \(Self.ffmpegErrorString(ret))")
+                    }
+                    // Zero the codec tag — let the muxer choose the appropriate tag.
+                    outStream.pointee.codecpar.pointee.codec_tag = 0
                 }
-                ret = avcodec_parameters_copy(outStream.pointee.codecpar, inputStream.pointee.codecpar)
-                guard ret >= 0 else {
-                    throw FFmpegError.conversionFailed("avcodec_parameters_copy failed: \(Self.ffmpegErrorString(ret))")
-                }
-                outStream.pointee.codecpar.pointee.codec_tag = 0
                 
             } else if codecType == AVMEDIA_TYPE_AUDIO {
-                // For HEVC (fMP4), ALL audio must be transcoded to AAC to match
-                // the init segment. EAC3/AC3 can't be directly copied into fMP4
-                // with empty_moov movflags (FFmpeg can't build AudioSpecificConfig
-                // without parsing packets first, which isn't possible in init-only mode).
-                let canCopyAudio = !isHEVCSource && tsCompatibleAudio.contains(codecId)
+                // For MPEG-TS output, TS-compatible audio codecs can be copied directly.
+                // This includes AAC, AC3, EAC3, MP3, and MP2.
+                // Non-TS-compatible codecs (Opus, Vorbis, FLAC, etc.) need AAC transcode.
+                let canCopyAudio = tsCompatibleAudio.contains(codecId)
                 
                 if canCopyAudio {
                     // Audio can be copied directly (MPEG-TS output only)
@@ -947,6 +1592,12 @@ final class FFmpegService {
             if let fifo = audioFifo {
                 av_audio_fifo_free(fifo)
             }
+            // Clean up video transcode state
+            var vdec: UnsafeMutablePointer<AVCodecContext>? = videoDecCtx
+            var venc: UnsafeMutablePointer<AVCodecContext>? = videoEncCtx
+            if vdec != nil { avcodec_free_context(&vdec) }
+            if venc != nil { avcodec_free_context(&venc) }
+            if swsCtx != nil { sws_freeContext(swsCtx) }
         }
         
         guard outputStreamIndex > 0 else {
@@ -963,12 +1614,9 @@ final class FFmpegService {
         }
         
         // --- Write header ---
-        // For HEVC (fMP4), set movflags for fragmented MP4 output.
-        // Must match the init segment's movflags exactly.
         var muxOpts: OpaquePointer?  // AVDictionary*
-        if isHEVCSource {
-            av_dict_set(&muxOpts, "movflags", "empty_moov+frag_keyframe+default_base_moof", 0)
-        }
+        // No special mux options needed for MPEG-TS output.
+        // Pass &muxOpts (nil) — avformat_write_header accepts nil options.
         // Pass &muxOpts always — it's nil for non-HEVC (MPEG-TS), which is fine.
         ret = avformat_write_header(outputCtxUnwrapped, &muxOpts)
         av_dict_free(&muxOpts)
@@ -997,6 +1645,9 @@ final class FFmpegService {
         if let dec = audioDecCtx {
             avcodec_flush_buffers(dec)
         }
+        if let dec = videoDecCtx {
+            avcodec_flush_buffers(dec)
+        }
         
         // --- Read packets and write to output ---
         let endTime = startTime + duration
@@ -1017,7 +1668,41 @@ final class FFmpegService {
             av_frame_free(&frame)
         }
         
+        // Frame for video transcoding (HEVC decode output)
+        var videoFrame: UnsafeMutablePointer<AVFrame>?
+        // Converted frame for encoder (NV12 pixel format)
+        var videoConvertedFrame: UnsafeMutablePointer<AVFrame>?
+        if videoDecCtx != nil {
+            videoFrame = av_frame_alloc()
+            videoConvertedFrame = av_frame_alloc()
+        }
+        defer {
+            av_frame_free(&videoFrame)
+            av_frame_free(&videoConvertedFrame)
+        }
+        
         var wroteAnyPacket = false
+        
+        // Track the start time offset so each segment's timestamps start at 0.
+        // We capture the first video DTS in INPUT timebase, then subtract the
+        // equivalent value from all packets (video uses rescaled offset, audio
+        // already starts from 0 via audioNextPts).
+        var videoDtsOffsetInputTB: Int64? = nil  // First video DTS in input timebase
+        var videoPacketCount = 0  // Debug counter for first few video packets
+        
+        // --- Fix AV_NOPTS_VALUE DTS from MKV demuxer ---
+        // MKV demuxer delivers video packets in decode order but does NOT compute
+        // DTS for the first N packets (typically 1-2, the B-frame reorder depth).
+        // These arrive with dts = AV_NOPTS_VALUE which corrupts the fMP4 trun box.
+        // Strategy: track a monotonic video DTS counter. For any packet with
+        // dts == AV_NOPTS_VALUE, assign the next counter value. The counter starts
+        // at 0 and increments by the frame duration in the input timebase.
+        // After all fixups, enforce strict monotonicity as a final pass.
+        var videoDtsCounter: Int64 = 0
+        var videoFrameDurationInputTB: Int64 = 0  // computed from stream info or first DTS gap
+        var videoFrameDurationComputed = false
+        var videoInputStreamIdx: Int = -1  // remember which input stream is video
+        var lastVideoDtsOutput: Int64 = -1  // track last DTS written for monotonicity enforcement
         
         while true {
             ret = av_read_frame(inputCtx, pkt)
@@ -1169,7 +1854,208 @@ final class FFmpegService {
                 continue
             }
             
-            // --- Passthrough (copy) for compatible streams ---
+            // --- Video transcode path (HEVC→H.264) ---
+            if videoNeedsTranscode && streamIdx == videoTranscodeInputIdx,
+               let vDecCtx = videoDecCtx,
+               let vEncCtx = videoEncCtx,
+               let vFrame = videoFrame,
+               let vConvFrame = videoConvertedFrame {
+                
+                ret = avcodec_send_packet(vDecCtx, pkt)
+                av_packet_unref(pkt)
+                if ret < 0 { continue }
+                
+                while true {
+                    ret = avcodec_receive_frame(vDecCtx, vFrame)
+                    if ret < 0 { break }
+                    
+                    // Lazily initialize SwsContext when we know the actual decoded pixel format
+                    if swsCtx == nil {
+                        let srcFmt = AVPixelFormat(rawValue: vFrame.pointee.format)
+                        let dstFmt = vEncCtx.pointee.pix_fmt
+                        print("Setting up sws: \(srcFmt.rawValue) -> \(dstFmt.rawValue) (\(vDecCtx.pointee.width)x\(vDecCtx.pointee.height))")
+                        swsCtx = sws_getContext(
+                            vDecCtx.pointee.width, vDecCtx.pointee.height, srcFmt,
+                            vEncCtx.pointee.width, vEncCtx.pointee.height, dstFmt,
+                            Int32(SWS_FAST_BILINEAR.rawValue), nil, nil, nil
+                        )
+                        if swsCtx == nil {
+                            print("WARNING: sws_getContext failed! Video transcode will skip frames.")
+                            av_frame_unref(vFrame)
+                            continue
+                        }
+                        
+                        // Allocate buffer for converted frame
+                        vConvFrame.pointee.format = dstFmt.rawValue
+                        vConvFrame.pointee.width = vEncCtx.pointee.width
+                        vConvFrame.pointee.height = vEncCtx.pointee.height
+                        ret = av_frame_get_buffer(vConvFrame, 0)
+                        if ret < 0 {
+                            print("WARNING: av_frame_get_buffer failed for converted frame: \(Self.ffmpegErrorString(ret))")
+                            sws_freeContext(swsCtx)
+                            swsCtx = nil
+                            av_frame_unref(vFrame)
+                            continue
+                        }
+                    }
+                    
+                    // Convert pixel format (e.g. yuv420p10le → NV12)
+                    ret = av_frame_make_writable(vConvFrame)
+                    if ret < 0 {
+                        av_frame_unref(vFrame)
+                        continue
+                    }
+                    
+                    withUnsafePointer(to: vFrame.pointee.data) { srcData in
+                        withUnsafePointer(to: vFrame.pointee.linesize) { srcLinesize in
+                            srcData.withMemoryRebound(to: UnsafePointer<UInt8>?.self, capacity: 8) { srcPtr in
+                                srcLinesize.withMemoryRebound(to: Int32.self, capacity: 8) { srcLsPtr in
+                                    withUnsafeMutablePointer(to: &vConvFrame.pointee.data) { dstData in
+                                        withUnsafeMutablePointer(to: &vConvFrame.pointee.linesize) { dstLinesize in
+                                            dstData.withMemoryRebound(to: UnsafeMutablePointer<UInt8>?.self, capacity: 8) { dstPtr in
+                                                dstLinesize.withMemoryRebound(to: Int32.self, capacity: 8) { dstLsPtr in
+                                                    sws_scale(
+                                                        swsCtx,
+                                                        srcPtr, srcLsPtr,
+                                                        0, vDecCtx.pointee.height,
+                                                        dstPtr, dstLsPtr
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Copy timing from decoded frame
+                    vConvFrame.pointee.pts = vFrame.pointee.pts
+                    vConvFrame.pointee.pkt_dts = vFrame.pointee.pkt_dts
+                    vConvFrame.pointee.duration = vFrame.pointee.duration
+                    // Copy picture type so encoder knows about keyframes
+                    vConvFrame.pointee.pict_type = AV_PICTURE_TYPE_NONE  // Let encoder decide
+                    
+                    av_frame_unref(vFrame)
+                    
+                    // Encode to H.264
+                    ret = avcodec_send_frame(vEncCtx, vConvFrame)
+                    if ret < 0 {
+                        if ret != -11 { // EAGAIN
+                            print("avcodec_send_frame (video) failed: \(Self.ffmpegErrorString(ret))")
+                        }
+                        // Try to drain encoder even if send failed with EAGAIN
+                    }
+                    
+                    // Read encoded H.264 packets
+                    let encPkt = av_packet_alloc()!
+                    while true {
+                        ret = avcodec_receive_packet(vEncCtx, encPkt)
+                        if ret < 0 { break }
+                        
+                        encPkt.pointee.stream_index = Int32(outIdx)
+                        av_packet_rescale_ts(encPkt, vEncCtx.pointee.time_base, outputStream.pointee.time_base)
+                        
+                        // Fix negative DTS
+                        if encPkt.pointee.dts < 0 {
+                            let offset = Int64(bitPattern: 0) &- encPkt.pointee.dts
+                            encPkt.pointee.dts = 0
+                            if encPkt.pointee.pts != avNoPTS {
+                                let newPTS = encPkt.pointee.pts &+ offset
+                                encPkt.pointee.pts = newPTS < 0 ? 0 : newPTS
+                            }
+                        }
+                        
+                        encPkt.pointee.pos = -1
+                        ret = av_interleaved_write_frame(outputCtxUnwrapped, encPkt)
+                        if ret >= 0 { wroteAnyPacket = true }
+                    }
+                    var ep: UnsafeMutablePointer<AVPacket>? = encPkt
+                    av_packet_free(&ep)
+                }
+                continue
+            }
+            
+            // --- Passthrough (copy) for compatible streams (H.264 video, audio) ---
+            
+            // Fix video DTS from MKV demuxer and normalize to zero-based.
+            // (Only needed for HEVC passthrough — but kept for any MKV video stream)
+            if inputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO && !videoNeedsTranscode {
+                
+                // Compute frame duration once from stream metadata
+                if !videoFrameDurationComputed {
+                    videoInputStreamIdx = streamIdx
+                    let tb = inputStream.pointee.time_base
+                    // Try r_frame_rate first (most reliable for MKV), then avg_frame_rate
+                    let rfr = inputStream.pointee.r_frame_rate
+                    let afr = inputStream.pointee.avg_frame_rate
+                    if rfr.num > 0 && rfr.den > 0 {
+                        // frame_duration_in_tb = time_base.den / (r_frame_rate * time_base.num)
+                        // = (tb.den * rfr.den) / (rfr.num * tb.num)
+                        videoFrameDurationInputTB = Int64(tb.den) * Int64(rfr.den) / (Int64(rfr.num) * Int64(tb.num))
+                    } else if afr.num > 0 && afr.den > 0 {
+                        videoFrameDurationInputTB = Int64(tb.den) * Int64(afr.den) / (Int64(afr.num) * Int64(tb.num))
+                    } else {
+                        // Fallback: assume 24fps
+                        videoFrameDurationInputTB = Int64(tb.den) / (24 * Int64(tb.num))
+                    }
+                    if videoFrameDurationInputTB <= 0 { videoFrameDurationInputTB = 1 }
+                    videoFrameDurationComputed = true
+                    print("Video frame duration in input TB: \(videoFrameDurationInputTB) (TB: \(tb.num)/\(tb.den), r_frame_rate: \(rfr.num)/\(rfr.den))")
+                }
+                
+                let origDts = pkt.pointee.dts
+                let origPts = pkt.pointee.pts
+                
+                // Fix AV_NOPTS_VALUE DTS: assign monotonic counter value
+                if pkt.pointee.dts == avNoPTS {
+                    pkt.pointee.dts = videoDtsCounter
+                    videoDtsCounter = videoDtsCounter &+ videoFrameDurationInputTB
+                } else {
+                    // Real DTS from demuxer — update counter to stay ahead
+                    if pkt.pointee.dts &+ videoFrameDurationInputTB > videoDtsCounter {
+                        videoDtsCounter = pkt.pointee.dts &+ videoFrameDurationInputTB
+                    }
+                }
+                
+                // Capture the DTS offset from the first video packet (now always valid)
+                if videoDtsOffsetInputTB == nil {
+                    videoDtsOffsetInputTB = pkt.pointee.dts
+                    print("DTS normalization: video offset = \(videoDtsOffsetInputTB!) in input TB (\(inputStream.pointee.time_base.num)/\(inputStream.pointee.time_base.den))")
+                    print("  first video pkt: dts=\(pkt.pointee.dts) pts=\(pkt.pointee.pts) flags=\(pkt.pointee.flags)")
+                }
+                
+                // Subtract offset in input timebase BEFORE rescaling
+                let off = videoDtsOffsetInputTB!
+                pkt.pointee.dts = pkt.pointee.dts &- off
+                if pkt.pointee.pts != avNoPTS {
+                    pkt.pointee.pts = pkt.pointee.pts &- off
+                }
+                
+                // Ensure DTS <= PTS (required for valid fMP4)
+                if pkt.pointee.pts != avNoPTS && pkt.pointee.dts > pkt.pointee.pts {
+                    pkt.pointee.dts = pkt.pointee.pts
+                }
+                
+                // Enforce strict DTS monotonicity: if this DTS would go backwards
+                // or equal the previous one, bump it. This handles cases where the
+                // MKV demuxer's real DTS overlaps with our synthetic DTS assignments.
+                if lastVideoDtsOutput >= 0 && pkt.pointee.dts <= lastVideoDtsOutput {
+                    pkt.pointee.dts = lastVideoDtsOutput &+ 1
+                    // Also ensure DTS <= PTS after bump
+                    if pkt.pointee.pts != avNoPTS && pkt.pointee.dts > pkt.pointee.pts {
+                        pkt.pointee.pts = pkt.pointee.dts
+                    }
+                }
+                lastVideoDtsOutput = pkt.pointee.dts
+                
+                // Debug: print first 5 video packets
+                if videoPacketCount < 5 {
+                    print("  video pkt[\(videoPacketCount)]: origDts=\(origDts) origPts=\(origPts) -> fixedDts=\(pkt.pointee.dts) fixedPts=\(pkt.pointee.pts)")
+                }
+                videoPacketCount += 1
+            }
+            
             pkt.pointee.stream_index = Int32(outIdx)
             av_packet_rescale_ts(pkt, inputStream.pointee.time_base, outputStream.pointee.time_base)
             
@@ -1279,7 +2165,7 @@ final class FFmpegService {
             }
         }
         
-        // Flush encoder (drain remaining buffered frames)
+        // Flush audio encoder (drain remaining buffered frames)
         if let encCtx = audioEncCtx {
             avcodec_send_frame(encCtx, nil) // Signal EOF
             let flushPkt = av_packet_alloc()!
@@ -1313,6 +2199,41 @@ final class FFmpegService {
             }
         }
         
+        // Flush video encoder (drain remaining buffered H.264 frames)
+        if let vEncCtx = videoEncCtx {
+            print("Flushing H.264 VideoToolbox encoder...")
+            avcodec_send_frame(vEncCtx, nil) // Signal EOF
+            let flushPkt = av_packet_alloc()!
+            defer {
+                var fp: UnsafeMutablePointer<AVPacket>? = flushPkt
+                av_packet_free(&fp)
+            }
+            while true {
+                ret = avcodec_receive_packet(vEncCtx, flushPkt)
+                if ret < 0 { break }
+                
+                let outIdx = streamMapping[videoTranscodeInputIdx]
+                let outputStream = outputCtxUnwrapped.pointee.streams[outIdx]!
+                
+                flushPkt.pointee.stream_index = Int32(outIdx)
+                av_packet_rescale_ts(flushPkt, vEncCtx.pointee.time_base, outputStream.pointee.time_base)
+                
+                if flushPkt.pointee.dts < 0 {
+                    let offset = Int64(bitPattern: 0) &- flushPkt.pointee.dts
+                    flushPkt.pointee.dts = 0
+                    if flushPkt.pointee.pts != avNoPTS {
+                        let newPTS = flushPkt.pointee.pts &+ offset
+                        flushPkt.pointee.pts = newPTS < 0 ? 0 : newPTS
+                    }
+                }
+                
+                flushPkt.pointee.pos = -1
+                ret = av_interleaved_write_frame(outputCtxUnwrapped, flushPkt)
+                if ret >= 0 { wroteAnyPacket = true }
+            }
+            print("H.264 encoder flush complete")
+        }
+        
         // --- Finalize ---
         ret = av_write_trailer(outputCtxUnwrapped)
         if ret < 0 {
@@ -1324,27 +2245,9 @@ final class FFmpegService {
             avio_closep(&outputCtxUnwrapped.pointee.pb)
         }
         
-        // For HEVC fMP4 media segments: strip the leading ftyp+moov atoms.
-        // FFmpeg's empty_moov movflag writes ftyp+moov at the start of every output,
-        // but HLS fMP4 media segments must contain only moof+mdat (the init segment
-        // provides ftyp+moov via EXT-X-MAP). AirPlay receivers reject segments that
-        // duplicate the moov atom.
-        //
-        // KEY FIX: If init.mp4 doesn't exist yet, extract the ftyp+moov prefix from
-        // this segment and save it as the init segment. This guarantees the init
-        // segment's track IDs, codec params, and AAC extradata are identical to those
-        // in the media segments — they literally come from the same AVFormatContext.
-        // Previously, init.mp4 was generated by a separate AVFormatContext which
-        // could produce different track IDs and AAC AudioSpecificConfig, causing
-        // AirPlay receivers to reject the stream with error -15562.
-        if isHEVCSource {
-            let initPath = outputDirectory.appendingPathComponent("init.mp4").path
-            let needsInitSegment = !FileManager.default.fileExists(atPath: initPath)
-            try Self.stripFtypMoovFromSegment(
-                at: outputPath,
-                saveInitSegmentTo: needsInitSegment ? initPath : nil
-            )
-        }
+        // MPEG-TS segments are self-contained — no post-processing needed.
+        // (The old fMP4 path required stripping ftyp+moov prefix and extracting init.mp4,
+        // but MPEG-TS segments are ready to serve as-is.)
         
         guard wroteAnyPacket else {
             throw FFmpegError.conversionFailed("No packets written to segment")
@@ -1366,8 +2269,10 @@ final class FFmpegService {
         videoEncoder: VideoEncoder
     ) async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
-            // Use serial encodeQueue — only one encode at a time
+            // Use concurrent encodeQueue — bounded by semaphore
             self.encodeQueue.async {
+                self.encodeSemaphore.wait()
+                defer { self.encodeSemaphore.signal() }
                 guard let mpv = mpv_create() else {
                     continuation.resume(throwing: FFmpegError.mpvFailed("Failed to create mpv instance"))
                     return

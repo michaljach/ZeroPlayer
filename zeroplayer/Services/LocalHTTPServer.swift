@@ -358,13 +358,12 @@ nonisolated final class LocalHTTPServer: @unchecked Sendable {
             }
         }
         
-        // Check if this is a segment request (.ts for MPEG-TS HLS, .mp4 for fMP4 HEVC HLS)
-        let isSegmentRequest = cleanPath.hasPrefix("segment_") && (cleanPath.hasSuffix(".ts") || cleanPath.hasSuffix(".mp4"))
+        // Check if this is a segment request (.ts MPEG-TS segments)
+        let isSegmentRequest = cleanPath.hasPrefix("segment_") && cleanPath.hasSuffix(".ts")
         if isSegmentRequest {
-            // Extract segment index from filename (e.g., "segment_042.ts" -> 42 or "segment_042.mp4" -> 42)
+            // Extract segment index from filename (e.g., "segment_042.ts" -> 42)
             let segmentName = cleanPath
                 .replacingOccurrences(of: ".ts", with: "")
-                .replacingOccurrences(of: ".mp4", with: "")
             let indexString = segmentName.replacingOccurrences(of: "segment_", with: "")
             
             if let segmentIndex = Int(indexString) {
@@ -415,7 +414,7 @@ nonisolated final class LocalHTTPServer: @unchecked Sendable {
         // HLS playlists, subtitles, and segments always come from the HLS
         // directory. Only serve the source file for requests that look like
         // the actual video filename.
-        let isHLSSegment = cleanPath.hasPrefix("segment_") || cleanPath == "init.mp4"
+        let isHLSSegment = cleanPath.hasPrefix("segment_") && cleanPath.hasSuffix(".ts")
         if cleanPath.hasSuffix(".m3u8") || cleanPath.hasSuffix(".vtt") || cleanPath.hasSuffix(".ts") || isHLSSegment {
             // Generated HLS content — always from HLS directory
             fileToServe = hlsDirectory.appendingPathComponent(cleanPath)
@@ -465,12 +464,11 @@ nonisolated final class LocalHTTPServer: @unchecked Sendable {
         // Playlist and subtitle files should not be cached by AVPlayer
         let isPlaylistOrSubtitle = ["m3u8", "vtt"].contains(filePath.pathExtension.lowercased())
         
-        // HLS segments (.ts MPEG-TS files or .mp4 fMP4 files) should ALWAYS be loaded
+        // HLS segments (.ts MPEG-TS files) should ALWAYS be loaded
         // into memory and sent immediately. They are small (typically 200KB-2MB) and
         // AVPlayer expects immediate full content.
-        let isSegmentFile = filePath.pathExtension.lowercased() == "ts" ||
-            (filePath.lastPathComponent.hasPrefix("segment_") && filePath.pathExtension.lowercased() == "mp4") ||
-            filePath.lastPathComponent == "init.mp4"
+        let isSegmentFile = filePath.pathExtension.lowercased() == "ts" &&
+            filePath.lastPathComponent.hasPrefix("segment_")
         
         // For video files (but NOT .ts segments), ALWAYS use streaming (never load into memory)
         let isLargeVideoFile = ["mp4", "mov", "m4v", "mkv", "avi"].contains(filePath.pathExtension.lowercased())

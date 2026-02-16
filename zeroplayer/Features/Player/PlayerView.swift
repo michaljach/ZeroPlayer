@@ -528,9 +528,61 @@ struct PlayerView: View {
                     print("AirPlay: Player item ready to play")
                 case .failed:
                     print("AirPlay: Player item FAILED: \(playerItem.error?.localizedDescription ?? "unknown")")
+                    if let underlyingError = (playerItem.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError {
+                        print("AirPlay: Underlying error: \(underlyingError)")
+                    }
                 default:
                     break
                 }
+            }
+            .store(in: &avPlayerObservers)
+        
+        // Observe player error
+        newPlayer.publisher(for: \.status)
+            .sink { status in
+                if status == .failed {
+                    print("AirPlay: AVPlayer FAILED: \(newPlayer.error?.localizedDescription ?? "unknown")")
+                    if let underlyingError = (newPlayer.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError {
+                        print("AirPlay: Player underlying error: \(underlyingError)")
+                    }
+                }
+            }
+            .store(in: &avPlayerObservers)
+        
+        // Observe error log entries for detailed playback diagnostics
+        NotificationCenter.default.publisher(for: .AVPlayerItemNewErrorLogEntry, object: playerItem)
+            .sink { _ in
+                if let log = playerItem.errorLog() {
+                    for event in log.events {
+                        print("AirPlay: Error log entry: domain=\(event.errorDomain) code=\(event.errorStatusCode) comment=\(event.errorComment ?? "none") URI=\(event.uri ?? "none")")
+                    }
+                }
+            }
+            .store(in: &avPlayerObservers)
+        
+        // Observe access log for successful segment fetches
+        NotificationCenter.default.publisher(for: .AVPlayerItemNewAccessLogEntry, object: playerItem)
+            .sink { _ in
+                if let log = playerItem.accessLog(), let lastEvent = log.events.last {
+                    print("AirPlay: Access log: URI=\(lastEvent.uri ?? "?") bytesTransferred=\(lastEvent.numberOfBytesTransferred) indicatedBitrate=\(lastEvent.indicatedBitrate)")
+                }
+            }
+            .store(in: &avPlayerObservers)
+        
+        // Observe failed-to-play-to-end notification
+        NotificationCenter.default.publisher(for: .AVPlayerItemFailedToPlayToEndTime, object: playerItem)
+            .sink { notification in
+                if let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error {
+                    print("AirPlay: Failed to play to end: \(error)")
+                }
+            }
+            .store(in: &avPlayerObservers)
+        
+        // Observe playback stalls
+        NotificationCenter.default.publisher(for: .AVPlayerItemPlaybackStalled, object: playerItem)
+            .sink { _ in
+                print("AirPlay: Playback stalled!")
+                print("AirPlay: Player rate=\(newPlayer.rate) reasonForWaitingToPlay=\(newPlayer.reasonForWaitingToPlay?.rawValue ?? "none")")
             }
             .store(in: &avPlayerObservers)
         
@@ -541,25 +593,54 @@ struct PlayerView: View {
             }
             .store(in: &avPlayerObservers)
         
-        // Wait for ready, seek if needed, then play
-        let seekTime = position > 1.0 ? CMTime(seconds: position, preferredTimescale: 600) : nil
-        Task {
-            for await status in playerItem.publisher(for: \.status).values {
-                if status == .readyToPlay {
-                    if let seekTime {
-                        print("AirPlay: Seeking to \(position)s before starting playback")
-                        await newPlayer.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero)
-                    }
-                    newPlayer.play()
-                    // Auto-select the subtitle track if one is pre-selected
-                    await enableSubtitleTrackInAVPlayer(newPlayer)
-                    break
-                } else if status == .failed {
-                    print("AirPlay: player item failed: \(playerItem.error?.localizedDescription ?? "unknown")")
-                    break
+        // Observe timeControlStatus to track play/pause/buffering state
+        newPlayer.publisher(for: \.timeControlStatus)
+            .sink { [weak newPlayer] status in
+                guard let player = newPlayer else { return }
+                switch status {
+                case .paused:
+                    print("AirPlay: timeControlStatus = PAUSED, rate=\(player.rate)")
+                case .waitingToPlayAtSpecifiedRate:
+                    print("AirPlay: timeControlStatus = WAITING, reason=\(player.reasonForWaitingToPlay?.rawValue ?? "none") rate=\(player.rate)")
+                case .playing:
+                    print("AirPlay: timeControlStatus = PLAYING, rate=\(player.rate) currentTime=\(player.currentTime().seconds)")
+                @unknown default:
+                    print("AirPlay: timeControlStatus = unknown(\(status.rawValue))")
                 }
             }
-        }
+            .store(in: &avPlayerObservers)
+        
+        // Wait for ready, seek if needed, then play
+        // IMPORTANT: Use the Combine publisher sink (not AsyncPublisher) to avoid
+        // missing the readyToPlay event if it fires before the async for-loop starts.
+        let seekTime = position > 1.0 ? CMTime(seconds: position, preferredTimescale: 600) : nil
+        var playbackStarted = false
+        playerItem.publisher(for: \.status)
+            .sink { [weak newPlayer] status in
+                guard let player = newPlayer, !playbackStarted else { return }
+                if status == .readyToPlay {
+                    playbackStarted = true
+                    if let seekTime {
+                        print("AirPlay: Seeking to \(position)s before starting playback")
+                        player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+                            print("AirPlay: Seek completed (finished=\(finished)), calling play()")
+                            player.play()
+                            print("AirPlay: play() called, rate=\(player.rate) timeControlStatus=\(player.timeControlStatus.rawValue)")
+                        }
+                    } else {
+                        print("AirPlay: No seek needed, calling play()")
+                        player.play()
+                        print("AirPlay: play() called, rate=\(player.rate) timeControlStatus=\(player.timeControlStatus.rawValue)")
+                    }
+                    // Auto-select the subtitle track if one is pre-selected
+                    Task {
+                        await self.enableSubtitleTrackInAVPlayer(player)
+                    }
+                } else if status == .failed {
+                    print("AirPlay: player item failed: \(playerItem.error?.localizedDescription ?? "unknown")")
+                }
+            }
+            .store(in: &avPlayerObservers)
     }
     
     private func reloadAVPlayerForSubtitleChange() {

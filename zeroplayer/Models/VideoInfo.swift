@@ -14,19 +14,22 @@ struct VideoInfo: Equatable {
     /// True if the video codec is HEVC (H.265). Apple's HLS requires HEVC to use
     /// fMP4 segments instead of MPEG-TS.
     let isHEVC: Bool
+    /// HEVC codec string parsed from HEVCDecoderConfigurationRecord (e.g. "hvc1.2.4.L153.B0").
+    /// Used in HLS master playlist CODECS attribute. Nil for non-HEVC content.
+    let hevcCodecString: String?
     
     var durationInSeconds: Double {
         duration.seconds
     }
     
-    /// File extension for HLS segments: `.mp4` for HEVC (fMP4), `.ts` for H.264 (MPEG-TS)
+    /// File extension for HLS segments: always `.ts` (MPEG-TS for both H.264 and HEVC)
     var segmentExtension: String {
-        isHEVC ? "mp4" : "ts"
+        "ts"
     }
     
-    /// FFmpeg muxer format name
+    /// FFmpeg muxer format name: always `mpegts`
     var segmentMuxerFormat: String {
-        isHEVC ? "mp4" : "mpegts"
+        "mpegts"
     }
     
     static func == (lhs: VideoInfo, rhs: VideoInfo) -> Bool {
@@ -39,5 +42,6 @@ struct VideoInfo: Equatable {
         && lhs.needsConversion == rhs.needsConversion
         && lhs.needsAudioConversion == rhs.needsAudioConversion
         && lhs.isHEVC == rhs.isHEVC
+        && lhs.hevcCodecString == rhs.hevcCodecString
     }
 }

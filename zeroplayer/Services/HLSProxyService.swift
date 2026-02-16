@@ -102,11 +102,8 @@ final class HLSProxyService: SegmentGenerator {
             throw ProxyError.ffmpegFailed(error)
         }
         
-        // Step 4a: For HEVC, the fMP4 initialization segment (init.mp4) is now
-        // extracted automatically from the first media segment during remuxing.
-        // This guarantees the init segment's track IDs and codec parameters match
-        // the media segments exactly (they come from the same AVFormatContext).
-        // No separate generation step needed here.
+        // All segments are now MPEG-TS (.ts) for both H.264 and HEVC sources.
+        // No separate init segment generation needed.
         
         // Step 4b: Extract the first subtitle (if any) and regenerate master.m3u8
         // so it's available in the initial playlist. This avoids the reload dance
@@ -134,11 +131,13 @@ final class HLSProxyService: SegmentGenerator {
         
         print("✅ HLS stream ready at: \(playbackURL.absoluteString)")
         
-        // Step 6: Pre-generate the first 3 segments so AVPlayer has data immediately.
+        // Step 6: Pre-generate the first 5 segments so AVPlayer has data immediately.
         // This is critical — AVPlayer requests segments as soon as it loads the playlist
         // and will stall/fail if they're not ready fast enough.
-        print("⏳ Pre-generating first segments...")
-        for i in 0..<3 {
+        // 5 segments (50s) gives more buffer for HEVC transcode which is CPU-intensive.
+        let pregenCount = 5
+        print("⏳ Pre-generating first \(pregenCount) segments...")
+        for i in 0..<pregenCount {
             do {
                 let _ = try await ffmpegService.generateSegment(
                     from: url,
@@ -153,7 +152,7 @@ final class HLSProxyService: SegmentGenerator {
         }
         
         // Step 7: Start background look-ahead generation
-        startLookAhead(from: 3)
+        startLookAhead(from: pregenCount)
         
         return playbackURL
     }
@@ -308,21 +307,25 @@ final class HLSProxyService: SegmentGenerator {
         }
     }
     
-    /// Protocol method: generates segment for the HTTP server
+    /// Protocol method: generates segment for the HTTP server.
+    /// Player-requested segments get priority over look-ahead: we cancel the
+    /// look-ahead task before requesting so it frees the encode semaphore slot,
+    /// then restart look-ahead after the player's segment is done.
     func generateSegment(index: Int) async throws -> URL {
         guard let sourceFile = sourceFileURL,
-              let videoInfo = currentVideoInfo else {
+              currentVideoInfo != nil else {
             throw ProxyError.invalidSourceFile
         }
         
         // Track the highest requested segment for look-ahead throttling.
-        // If the player is requesting a segment beyond our current look-ahead window,
-        // restart look-ahead from that segment.
         if index > lastRequestedSegment {
             lastRequestedSegment = index
-            // Restart look-ahead from the newly requested position
-            startLookAhead(from: index + 1)
         }
+        
+        // Cancel look-ahead so it releases the encode semaphore slot,
+        // giving this player-requested segment priority.
+        lookAheadTask?.cancel()
+        lookAheadTask = nil
         
         do {
             let url = try await ffmpegService.generateSegment(
@@ -331,8 +334,13 @@ final class HLSProxyService: SegmentGenerator {
                 segmentDuration: 10.0
             )
             
+            // Restart look-ahead from the next segment after this one
+            startLookAhead(from: index + 1)
+            
             return url
         } catch {
+            // Still restart look-ahead even on failure
+            startLookAhead(from: index + 1)
             throw ProxyError.ffmpegFailed(error)
         }
     }
