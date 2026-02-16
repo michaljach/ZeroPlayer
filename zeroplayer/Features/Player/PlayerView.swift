@@ -263,7 +263,6 @@ struct PlayerView: View {
             }
         }
         .padding()
-        .background(.ultraThinMaterial.opacity(0.6))
     }
     
     // MARK: - AirPlay Player View (HLS via AVPlayer)
