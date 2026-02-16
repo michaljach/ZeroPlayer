@@ -1,30 +1,23 @@
 import UIKit
 import Libmpv
 
-// MARK: - MetalLayer (MoltenVK workarounds)
+// MARK: - Metal Layer (sublayer approach, matches MPVKit Demo)
 
-/// Custom CAMetalLayer subclass with workarounds for MoltenVK rendering quirks.
-/// - drawableSize: Filters out bogus 1x1 values that MoltenVK sets to force-complete presentation
-/// - wantsExtendedDynamicRangeContent: Ensures EDR activation happens on main thread
-class MPVMetalLayer: CAMetalLayer {
+/// CAMetalLayer subclass used as a sublayer of the player view controller's
+/// root view. This follows the MPVKit Demo pattern for proper rotation
+/// handling — the layer frame is explicitly updated in `viewDidLayoutSubviews`,
+/// which triggers MoltenVK to recreate the Vulkan swapchain at the new size.
+///
+/// Includes a guard against MoltenVK's 1x1 drawableSize workaround that
+/// can cause flicker. See: https://github.com/mpv-player/mpv/pull/13651
+class MetalLayer: CAMetalLayer {
     override var drawableSize: CGSize {
-        get { super.drawableSize }
+        get { return super.drawableSize }
         set {
+            // MoltenVK sometimes sets drawableSize to 1x1 to force-complete
+            // a presentation. Filter these bogus values to prevent flicker.
             if Int(newValue.width) > 1 && Int(newValue.height) > 1 {
                 super.drawableSize = newValue
-            }
-        }
-    }
-    
-    override var wantsExtendedDynamicRangeContent: Bool {
-        get { super.wantsExtendedDynamicRangeContent }
-        set {
-            if Thread.isMainThread {
-                super.wantsExtendedDynamicRangeContent = newValue
-            } else {
-                DispatchQueue.main.sync {
-                    super.wantsExtendedDynamicRangeContent = newValue
-                }
             }
         }
     }
@@ -62,8 +55,12 @@ nonisolated final class MPVPlayerController: UIViewController {
     
     // mpv handle
     private var mpv: OpaquePointer?
-    private let metalLayer = MPVMetalLayer()
+    private var metalLayer = MetalLayer()
     private let queue = DispatchQueue(label: "com.zeroplayer.mpv", qos: .userInitiated)
+    
+    // Track the last known layer size to detect actual resize events
+    private var lastLayerSize: CGSize = .zero
+    private var vidReinitWorkItem: DispatchWorkItem?
     
     // Callbacks for SwiftUI integration
     var onPropertyChange: ((_ property: String, _ value: Any?) -> Void)?
@@ -78,7 +75,9 @@ nonisolated final class MPVPlayerController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .black
         
-        // Set up Metal layer
+        // Add Metal layer as a sublayer (matches MPVKit Demo pattern).
+        // The layer frame is explicitly updated in viewDidLayoutSubviews
+        // to ensure MoltenVK recreates the Vulkan swapchain on rotation.
         metalLayer.frame = view.bounds
         metalLayer.contentsScale = UIScreen.main.nativeScale
         metalLayer.framebufferOnly = true
@@ -96,7 +95,45 @@ nonisolated final class MPVPlayerController: UIViewController {
     
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        
+        let newSize = view.bounds.size
         metalLayer.frame = view.bounds
+        
+        // Detect actual size changes (e.g., rotation). mpv has no iOS vulkan
+        // context backend, so its internal vo->dwidth/dheight are never updated
+        // when the CAMetalLayer resizes. MoltenVK recreates the Vulkan swapchain
+        // at the new size, but mpv still renders at the old dimensions.
+        //
+        // Workaround: toggle vid off→on to force a full VO pipeline reinit.
+        // mpv re-reads the layer dimensions during reconfig.
+        // Debounced so we only reinit once after the rotation animation settles.
+        if lastLayerSize != .zero && newSize != lastLayerSize && mpv != nil {
+            vidReinitWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.forceVOReinit()
+            }
+            vidReinitWorkItem = workItem
+            // Fire as soon as layout settles — rotation animation calls
+            // viewDidLayoutSubviews many times, the debounce collapses them.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+        }
+        lastLayerSize = newSize
+    }
+    
+    /// Forces mpv to reinitialize its video output pipeline by toggling the
+    /// video track off and back on. Both property sets are synchronous on the
+    /// VO thread — no intermediate delay needed.
+    private func forceVOReinit() {
+        guard let mpv else { return }
+        print("MPV: Forcing VO reinit for resize (\(lastLayerSize))")
+        let wasPaused = getFlag("pause")
+        // vid=no tears down the Vulkan pipeline; vid=auto rebuilds it,
+        // picking up the current CAMetalLayer dimensions via reconfig().
+        mpv_set_property_string(mpv, "vid", "no")
+        mpv_set_property_string(mpv, "vid", "auto")
+        if !wasPaused {
+            setFlag("pause", false)
+        }
     }
     
     // MARK: - MPV Setup
@@ -118,7 +155,7 @@ nonisolated final class MPVPlayerController: UIViewController {
         checkError(mpv_request_log_messages(mpv, "no"))
         #endif
         
-        // Pass the Metal layer as the render target
+        // Pass the Metal layer (sublayer) as the render target
         var layerPtr = metalLayer
         checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &layerPtr))
         
@@ -375,6 +412,15 @@ nonisolated final class MPVPlayerController: UIViewController {
     }
     
     // MARK: - Video Track Controls (for AirPlay resource management)
+    
+    /// Toggles between fit (letterboxed) and fill (cropped) display modes.
+    /// Uses mpv's `panscan` property: 0.0 = fit, 1.0 = fill.
+    func setFillScreen(_ fill: Bool) {
+        guard let mpv else { return }
+        var val = fill ? 1.0 : 0.0
+        mpv_set_property(mpv, "panscan", MPV_FORMAT_DOUBLE, &val)
+        print("MPV: panscan = \(val) (\(fill ? "fill" : "fit"))")
+    }
     
     /// Disables video decoding/rendering to free GPU resources during AirPlay.
     /// Pauses rendering first and waits for in-flight Metal/MoltenVK command buffers

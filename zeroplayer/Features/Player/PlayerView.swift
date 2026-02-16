@@ -21,6 +21,9 @@ struct PlayerView: View {
     // Controls auto-hide
     @State private var hideControlsTask: Task<Void, Never>?
     
+    // Video fill mode: false = fit (letterbox), true = fill (crop)
+    @State private var isFillMode = false
+    
     var body: some View {
         ZStack {
             // Always keep mpv mounted so the controller persists across
@@ -34,11 +37,14 @@ struct PlayerView: View {
                 airPlayPlayerView
             }
         }
+        .ignoresSafeArea()
         .onAppear {
+            rotateToLandscape()
             store.send(.onAppear)
         }
         .onDisappear {
             cleanup()
+            rotateToPortrait()
             store.send(.onDisappear)
         }
         .fileImporter(
@@ -148,9 +154,10 @@ struct PlayerView: View {
     @ViewBuilder
     private var controlsOverlay: some View {
         VStack {
-            // Close button at top
+            // Top-right buttons
             HStack {
                 Spacer()
+                fillModeButton
                 Button {
                     store.send(.closeButtonTapped)
                 } label: {
@@ -164,10 +171,48 @@ struct PlayerView: View {
             
             Spacer()
             
-            // Bottom transport controls
+            // Center playback controls
+            mpvPlaybackControls
+            
+            Spacer()
+            
+            // Bottom transport bar
             mpvTransportControls
         }
         .transition(.opacity)
+    }
+    
+    // MARK: - MPV Playback Controls (center)
+    
+    private var mpvPlaybackControls: some View {
+        HStack(spacing: 48) {
+            Button {
+                mpvController?.seekRelative(-10)
+                store.send(.seekBackwardTapped)
+            } label: {
+                Image(systemName: "gobackward.10")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.white)
+            }
+            
+            Button {
+                mpvController?.togglePause()
+                store.send(.playPauseTapped)
+            } label: {
+                Image(systemName: store.isPaused ? "play.circle.fill" : "pause.circle.fill")
+                    .font(.system(size: 56))
+                    .foregroundStyle(.white)
+            }
+            
+            Button {
+                mpvController?.seekRelative(10)
+                store.send(.seekForwardTapped)
+            } label: {
+                Image(systemName: "goforward.10")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.white)
+            }
+        }
     }
     
     // MARK: - MPV Transport Controls
@@ -207,42 +252,10 @@ struct PlayerView: View {
                     .monospacedDigit()
             }
             
-            // Play/Pause + action buttons
+            // Subtitle + AirPlay buttons
             HStack {
                 Spacer()
                 
-                HStack(spacing: 40) {
-                    Button {
-                        mpvController?.seekRelative(-10)
-                        store.send(.seekBackwardTapped)
-                    } label: {
-                        Image(systemName: "gobackward.10")
-                            .font(.system(size: 24))
-                            .foregroundStyle(.white)
-                    }
-                    
-                    Button {
-                        mpvController?.togglePause()
-                        store.send(.playPauseTapped)
-                    } label: {
-                        Image(systemName: store.isPaused ? "play.circle.fill" : "pause.circle.fill")
-                            .font(.system(size: 44))
-                            .foregroundStyle(.white)
-                    }
-                    
-                    Button {
-                        mpvController?.seekRelative(10)
-                        store.send(.seekForwardTapped)
-                    } label: {
-                        Image(systemName: "goforward.10")
-                            .font(.system(size: 24))
-                            .foregroundStyle(.white)
-                    }
-                }
-                
-                Spacer()
-                
-                // Subtitle + AirPlay buttons
                 HStack(spacing: 12) {
                     mpvSubtitleButton
                     airPlayRoutePickerButton
@@ -293,34 +306,90 @@ struct PlayerView: View {
                     .background(Color.black)
             }
             
-            VStack {
-                // Close button at top
-                HStack {
+            // Tap to toggle controls
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    store.send(.toggleControlsTapped)
+                    if store.showControls {
+                        scheduleHideControls()
+                    }
+                }
+            
+            if store.showControls {
+                VStack {
+                    // Top-right buttons
+                    HStack {
+                        Spacer()
+                        fillModeButton
+                        Button {
+                            store.send(.closeButtonTapped)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 32))
+                                .foregroundStyle(.white, .black.opacity(0.3))
+                        }
+                        .padding()
+                    }
+                    .padding(.top, safeAreaTop)
+                    
                     Spacer()
-                    Button {
-                        store.send(.closeButtonTapped)
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 32))
-                            .foregroundStyle(.white, .black.opacity(0.3))
+                    
+                    // Bottom action buttons
+                    HStack {
+                        Spacer()
+                        HStack(spacing: 12) {
+                            hlsSubtitleButton
+                            airPlayRoutePickerButton
+                        }
                     }
                     .padding()
+                    .background(.ultraThinMaterial.opacity(0.6))
                 }
-                .padding(.top, safeAreaTop)
-                
-                Spacer()
-                
-                // Bottom action buttons
-                HStack {
-                    Spacer()
-                    HStack(spacing: 12) {
-                        hlsSubtitleButton
-                        airPlayRoutePickerButton
-                    }
-                }
-                .padding()
-                .background(.ultraThinMaterial.opacity(0.6))
+                .transition(.opacity)
             }
+        }
+    }
+    
+    // MARK: - Fill/Fit Mode Button
+    
+    private var fillModeButton: some View {
+        Button {
+            isFillMode.toggle()
+            mpvController?.setFillScreen(isFillMode)
+        } label: {
+            Image(systemName: isFillMode ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 20))
+                .foregroundStyle(.white)
+                .frame(width: 32, height: 32)
+        }
+    }
+    
+    // MARK: - Auto-Rotation
+    
+    private func rotateToLandscape() {
+        guard let windowScene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene }).first else { return }
+        
+        windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight)) { error in
+            print("Rotation request error: \(error)")
+        }
+        
+        if let rootVC = windowScene.windows.first?.rootViewController {
+            rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
+        }
+    }
+    
+    private func rotateToPortrait() {
+        guard let windowScene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene }).first else { return }
+        
+        windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait)) { error in
+            print("Rotation request error: \(error)")
+        }
+        
+        if let rootVC = windowScene.windows.first?.rootViewController {
+            rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
         }
     }
     
