@@ -9,11 +9,11 @@
 /* Begin PBXBuildFile section */
 		82CDA1E62F4223F6006441CC /* MPVKit-GPL in Frameworks */ = {isa = PBXBuildFile; productRef = 82CDA1E52F4223F6006441CC /* MPVKit-GPL */; };
 		82CDA2FB2F42375A006441CC /* ComposableArchitecture in Frameworks */ = {isa = PBXBuildFile; productRef = 82CDA2FA2F42375A006441CC /* ComposableArchitecture */; };
+		83A100032F50000100AAA111 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83A100022F50000100AAA111 /* XCTest.framework */; };
+		83A1000E2F50000100AAA111 /* ComposableArchitecture in Frameworks */ = {isa = PBXBuildFile; productRef = 82CDA2FA2F42375A006441CC /* ComposableArchitecture */; };
 		83A100202F50000100AAA111 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001D2F50000100AAA111 /* Dependencies */; };
 		83A100212F50000100AAA111 /* CasePaths in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001E2F50000100AAA111 /* CasePaths */; };
 		83A100222F50000100AAA111 /* ConcurrencyExtras in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001F2F50000100AAA111 /* ConcurrencyExtras */; };
-		83A100032F50000100AAA111 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83A100022F50000100AAA111 /* XCTest.framework */; };
-		83A1000E2F50000100AAA111 /* ComposableArchitecture in Frameworks */ = {isa = PBXBuildFile; productRef = 82CDA2FA2F42375A006441CC /* ComposableArchitecture */; };
 		83A100232F50000100AAA111 /* Dependencies in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001D2F50000100AAA111 /* Dependencies */; };
 		83A100242F50000100AAA111 /* CasePaths in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001E2F50000100AAA111 /* CasePaths */; };
 		83A100252F50000100AAA111 /* ConcurrencyExtras in Frameworks */ = {isa = PBXBuildFile; productRef = 83A1001F2F50000100AAA111 /* ConcurrencyExtras */; };

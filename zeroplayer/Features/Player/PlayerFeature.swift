@@ -42,6 +42,7 @@ struct PlayerFeature: Reducer {
         case seekSliderValueChanged(Double)
         case toggleControlsTapped
         case hideControls
+        case subtitleMenuOpened
 
         case closeButtonTapped
 
@@ -65,6 +66,7 @@ struct PlayerFeature: Reducer {
         case hlsPreparation
         case subtitleSelection
         case subtitleDownload
+        case subtitleSearch
     }
 
     @Dependency(\.continuousClock) var clock
@@ -153,6 +155,9 @@ struct PlayerFeature: Reducer {
         case .hideControls:
             state.showControls = false
             return .none
+
+        case .subtitleMenuOpened:
+            return .cancel(id: CancelID.hideControls)
 
         case .closeButtonTapped:
             return .send(.delegate(.closePlayer))
@@ -256,14 +261,32 @@ struct PlayerFeature: Reducer {
                 }
                 return .merge(childEffect, effect)
 
-            case .delegate(.downloadFromInternetRequested):
+            case .delegate(.searchInternetSubtitles(let languageCode)):
+                let sourceFileURL = state.sourceFileURL
+                let subtitleDownloader = self.subtitleDownloadClient
+                let effect: Effect<Action> = .run { send in
+                    do {
+                        await send(.subtitle(.internetSubtitleSearchStarted))
+                        let normalizedLanguage = languageCode == "any" ? nil : languageCode
+                        let subtitles = try await subtitleDownloader.searchSubtitles(sourceFileURL, normalizedLanguage)
+                        await send(.subtitle(.internetSubtitleSearchSucceeded(subtitles)))
+                    } catch {
+                        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                        await send(.subtitle(.internetSubtitleSearchFailed(message)))
+                    }
+                }
+                .cancellable(id: CancelID.subtitleSearch, cancelInFlight: true)
+
+                return .merge(childEffect, effect)
+
+            case .delegate(.downloadInternetSubtitle(let subtitle)):
                 let sourceFileURL = state.sourceFileURL
                 let isAirPlaying = state.airPlay.isAirPlaying
                 let subtitleDownloader = self.subtitleDownloadClient
                 let effect: Effect<Action> = .run { send in
                     do {
-                        let subtitleURL = try await subtitleDownloader.downloadBestSubtitle(sourceFileURL)
-                        await send(.subtitle(.downloadSucceeded(subtitleURL)))
+                        let subtitleURL = try await subtitleDownloader.downloadSubtitle(subtitle, sourceFileURL)
+                        await send(.subtitle(.internetSubtitleDownloadSucceeded(subtitleURL)))
 
                         if isAirPlaying {
                             await send(.subtitle(.delegate(.addExternalSubtitleHLS(subtitleURL))))
@@ -272,7 +295,7 @@ struct PlayerFeature: Reducer {
                         }
                     } catch {
                         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                        await send(.subtitle(.downloadFailed(message)))
+                        await send(.subtitle(.internetSubtitleDownloadFailed(message)))
                     }
                 }
                 .cancellable(id: CancelID.subtitleDownload, cancelInFlight: true)

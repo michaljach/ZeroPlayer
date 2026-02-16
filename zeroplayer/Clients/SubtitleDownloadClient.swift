@@ -2,22 +2,29 @@ import Dependencies
 import Foundation
 
 struct SubtitleDownloadClient {
-    var downloadBestSubtitle: (_ sourceFileURL: URL) async throws -> URL
+    var searchSubtitles: (_ sourceFileURL: URL, _ languageCode: String?) async throws -> [InternetSubtitleOption]
+    var downloadSubtitle: (_ subtitle: InternetSubtitleOption, _ sourceFileURL: URL) async throws -> URL
 }
 
 extension SubtitleDownloadClient: DependencyKey {
     static let liveValue: SubtitleDownloadClient = {
         let service = SubtitleDownloadService()
         return SubtitleDownloadClient(
-            downloadBestSubtitle: { sourceFileURL in
-                try await service.downloadBestSubtitle(for: sourceFileURL)
+            searchSubtitles: { sourceFileURL, languageCode in
+                try await service.searchSubtitles(for: sourceFileURL, languageCode: languageCode)
+            },
+            downloadSubtitle: { subtitle, sourceFileURL in
+                try await service.downloadSubtitle(subtitle, for: sourceFileURL)
             }
         )
     }()
 
     static let testValue = SubtitleDownloadClient(
-        downloadBestSubtitle: { _ in
-            unimplemented("SubtitleDownloadClient.downloadBestSubtitle", placeholder: URL(fileURLWithPath: "/tmp/subtitle.srt"))
+        searchSubtitles: { _, _ in
+            unimplemented("SubtitleDownloadClient.searchSubtitles", placeholder: [])
+        },
+        downloadSubtitle: { _, _ in
+            unimplemented("SubtitleDownloadClient.downloadSubtitle", placeholder: URL(fileURLWithPath: "/tmp/subtitle.srt"))
         }
     )
 }

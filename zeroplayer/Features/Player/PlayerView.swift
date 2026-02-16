@@ -20,6 +20,9 @@ struct PlayerView: View {
     
     // Controls auto-hide
     @State private var hideControlsTask: Task<Void, Never>?
+    @State private var suppressControlsToggleUntil: Date?
+    @State private var isShowingSubtitleOptionsSheet = false
+    @State private var isShowingInternetSubtitleList = false
     
     // Video fill mode: false = fit (letterbox), true = fill (crop)
     @State private var isFillMode = false
@@ -59,6 +62,12 @@ struct PlayerView: View {
         ) { result in
             handleExternalSubtitleFile(result)
         }
+        .sheet(isPresented: $isShowingSubtitleOptionsSheet, onDismiss: {
+            isShowingInternetSubtitleList = false
+            scheduleHideControls()
+        }) {
+            subtitleOptionsSheet
+        }
         .onChange(of: store.subtitle.isShowingFilePicker) { _, isShowing in
             if !isShowing {
                 scheduleHideControls()
@@ -85,7 +94,7 @@ struct PlayerView: View {
         }
         .onChange(of: store.pendingMPVExternalSubtitleURL) { _, newURL in
             guard let newURL else { return }
-            mpvController?.addExternalSubtitle(newURL.path)
+            mpvController?.addExternalSubtitle(newURL)
             store.send(.subtitle(.mpvExternalSubtitleLoaded(newURL.path)))
         }
     }
@@ -133,6 +142,7 @@ struct PlayerView: View {
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture {
+                    if shouldSuppressControlsToggle { return }
                     store.send(.toggleControlsTapped)
                     if store.showControls {
                         scheduleHideControls()
@@ -314,6 +324,7 @@ struct PlayerView: View {
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture {
+                    if shouldSuppressControlsToggle { return }
                     store.send(.toggleControlsTapped)
                     if store.showControls {
                         scheduleHideControls()
@@ -408,55 +419,9 @@ struct PlayerView: View {
     
     @ViewBuilder
     private var mpvSubtitleButton: some View {
-        Menu {
-            Button {
-                mpvController?.disableSubtitles()
-                store.send(.subtitle(.mpvSubtitlesDisabled))
-            } label: {
-                HStack {
-                    Text("Off")
-                    if store.subtitle.selectedMPVTrackId == nil {
-                        Image(systemName: "checkmark")
-                    }
-                }
-            }
-            
-            if !store.subtitle.mpvTracks.isEmpty {
-                Divider()
-                
-                ForEach(store.subtitle.mpvTracks) { track in
-                    Button {
-                        mpvController?.selectSubtitleTrack(track.id)
-                        store.send(.subtitle(.mpvTrackSelected(track.id)))
-                    } label: {
-                        HStack {
-                            Text(track.displayName)
-                            if store.subtitle.selectedMPVTrackId == track.id {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            }
-            
-            Divider()
-            
-            Button {
-                hideControlsTask?.cancel()
-                store.send(.subtitle(.loadFromFileTapped))
-            } label: {
-                Label("Load from File...", systemImage: "doc.badge.plus")
-            }
-
-            Button {
-                store.send(.subtitle(.downloadFromInternetTapped))
-            } label: {
-                Label(
-                    store.subtitle.isDownloading ? "Downloading..." : "Download from Internet",
-                    systemImage: store.subtitle.isDownloading ? "arrow.down.circle.fill" : "arrow.down.circle"
-                )
-            }
-            .disabled(store.subtitle.isDownloading)
+        Button {
+            handleSubtitleMenuOpened()
+            isShowingSubtitleOptionsSheet = true
         } label: {
             Image(systemName: store.subtitle.selectedMPVTrackId != nil ? "captions.bubble.fill" : "captions.bubble")
                 .font(.system(size: 22))
@@ -470,53 +435,9 @@ struct PlayerView: View {
     
     @ViewBuilder
     private var hlsSubtitleButton: some View {
-        Menu {
-            Button {
-                store.send(.subtitle(.hlsSubtitlesDisabled))
-            } label: {
-                HStack {
-                    Text("Off")
-                    if store.subtitle.selectedHLSTrack == nil {
-                        Image(systemName: "checkmark")
-                    }
-                }
-            }
-            
-            if !store.subtitle.hlsTracks.isEmpty {
-                Divider()
-                
-                ForEach(store.subtitle.hlsTracks) { track in
-                    Button {
-                        store.send(.subtitle(.hlsTrackSelected(track)))
-                    } label: {
-                        HStack {
-                            Text(track.displayName)
-                            if store.subtitle.selectedHLSTrack == track {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            }
-            
-            Divider()
-            
-            Button {
-                hideControlsTask?.cancel()
-                store.send(.subtitle(.loadFromFileTapped))
-            } label: {
-                Label("Load from File...", systemImage: "doc.badge.plus")
-            }
-
-            Button {
-                store.send(.subtitle(.downloadFromInternetTapped))
-            } label: {
-                Label(
-                    store.subtitle.isDownloading ? "Downloading..." : "Download from Internet",
-                    systemImage: store.subtitle.isDownloading ? "arrow.down.circle.fill" : "arrow.down.circle"
-                )
-            }
-            .disabled(store.subtitle.isDownloading)
+        Button {
+            handleSubtitleMenuOpened()
+            isShowingSubtitleOptionsSheet = true
         } label: {
             Image(systemName: store.subtitle.selectedHLSTrack != nil ? "captions.bubble.fill" : "captions.bubble")
                 .font(.system(size: 22))
@@ -525,13 +446,134 @@ struct PlayerView: View {
                 .background(Circle().fill(.black.opacity(0.3)))
         }
     }
+
+    private var subtitleOptionsSheet: some View {
+        NavigationStack {
+            List {
+                Section("Tracks") {
+                    if store.airPlay.isAirPlaying {
+                        Button {
+                            store.send(.subtitle(.hlsSubtitlesDisabled))
+                            isShowingSubtitleOptionsSheet = false
+                        } label: {
+                            HStack {
+                                Text("Off")
+                                Spacer()
+                                if store.subtitle.selectedHLSTrack == nil {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+
+                        ForEach(store.subtitle.hlsTracks) { track in
+                            Button {
+                                store.send(.subtitle(.hlsTrackSelected(track)))
+                                isShowingSubtitleOptionsSheet = false
+                            } label: {
+                                HStack {
+                                    Text(track.displayName)
+                                    Spacer()
+                                    if store.subtitle.selectedHLSTrack == track {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Button {
+                            mpvController?.disableSubtitles()
+                            store.send(.subtitle(.mpvSubtitlesDisabled))
+                            isShowingSubtitleOptionsSheet = false
+                        } label: {
+                            HStack {
+                                Text("Off")
+                                Spacer()
+                                if store.subtitle.selectedMPVTrackId == nil {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+
+                        ForEach(store.subtitle.mpvTracks) { track in
+                            Button {
+                                mpvController?.selectSubtitleTrack(track.id)
+                                store.send(.subtitle(.mpvTrackSelected(track.id)))
+                                isShowingSubtitleOptionsSheet = false
+                            } label: {
+                                HStack {
+                                    Text(track.displayName)
+                                    Spacer()
+                                    if store.subtitle.selectedMPVTrackId == track.id {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section("Actions") {
+                    Button {
+                        isShowingSubtitleOptionsSheet = false
+                        hideControlsTask?.cancel()
+                        store.send(.subtitle(.loadFromFileTapped))
+                    } label: {
+                        Label("Load from File...", systemImage: "doc.badge.plus")
+                    }
+
+                    Button {
+                        store.send(.subtitle(.downloadFromInternetTapped))
+                        isShowingInternetSubtitleList = true
+                    } label: {
+                        Label("Download from Internet", systemImage: "arrow.down.circle")
+                    }
+                }
+            }
+            .navigationTitle("Subtitles")
+            .navigationDestination(isPresented: $isShowingInternetSubtitleList) {
+                InternetSubtitleSheetView(
+                    store: store.scope(state: \.subtitle, action: \.subtitle),
+                    onSubtitleSelected: {
+                        isShowingInternetSubtitleList = false
+                        isShowingSubtitleOptionsSheet = false
+                    }
+                )
+            }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        isShowingSubtitleOptionsSheet = false
+                    }
+                }
+            }
+        }
+    }
     
     // MARK: - AirPlay Activation / Deactivation
-    
+
     private func handleAirPlayActivated() {
         // Pause mpv and disable video decoding to free GPU/memory
         mpvController?.pause()
         mpvController?.disableVideoTrack()
+    }
+
+    private func handleSubtitleMenuOpened() {
+        suppressControlsToggleUntil = Date().addingTimeInterval(0.8)
+        hideControlsTask?.cancel()
+        store.send(.subtitleMenuOpened)
+
+        if store.airPlay.isAirPlaying {
+            avPlayer?.pause()
+        } else {
+            mpvController?.pause()
+        }
+    }
+
+    private var shouldSuppressControlsToggle: Bool {
+        if let until = suppressControlsToggleUntil {
+            return Date() < until
+        }
+        return false
     }
     
     private func handleAirPlayDeactivated() {
@@ -576,7 +618,7 @@ struct PlayerView: View {
                     store.send(.subtitle(.delegate(.addExternalSubtitleHLS(destURL))))
                 } else {
                     // Local mode: load directly into mpv
-                    mpvController?.addExternalSubtitle(destURL.path)
+                    mpvController?.addExternalSubtitle(destURL)
                 }
             } catch {
                 if accessing { fileURL.stopAccessingSecurityScopedResource() }

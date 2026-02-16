@@ -33,7 +33,7 @@ struct MPVSubtitleTrack: Identifiable, Hashable {
     let isExternal: Bool
     
     var displayName: String {
-        var name = title ?? "Track \(id)"
+        var name = normalizedDisplayTitle(from: title) ?? "Track \(id)"
         if let lang, !lang.isEmpty {
             name += " (\(lang))"
         }
@@ -41,6 +41,34 @@ struct MPVSubtitleTrack: Identifiable, Hashable {
             name += " [External]"
         }
         return name
+    }
+
+    private func normalizedDisplayTitle(from rawTitle: String?) -> String? {
+        guard var value = rawTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+
+        if let url = URL(string: value), url.lastPathComponent.isEmpty == false {
+            value = url.lastPathComponent
+        }
+
+        value = value.removingPercentEncoding ?? value
+        value = URL(fileURLWithPath: value).lastPathComponent
+
+        if value.hasPrefix("subtitle_") {
+            let suffix = value.dropFirst("subtitle_".count)
+            let base = suffix.split(separator: ".").first.map(String.init) ?? ""
+            if UUID(uuidString: base) != nil {
+                return "Downloaded Subtitle"
+            }
+        }
+
+        value = URL(fileURLWithPath: value).deletingPathExtension().lastPathComponent
+        value = value.replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return value.isEmpty ? nil : value
     }
 }
 
@@ -170,6 +198,9 @@ nonisolated final class MPVPlayerController: UIViewController {
         // Subtitle defaults
         checkError(mpv_set_option_string(mpv, "subs-match-os-language", "yes"))
         checkError(mpv_set_option_string(mpv, "subs-fallback", "yes"))
+        checkError(mpv_set_option_string(mpv, "access-references", "yes"))
+        checkError(mpv_set_option_string(mpv, "network", "yes"))
+        checkError(mpv_set_option_string(mpv, "demuxer-lavf-o", "protocol_whitelist=[file,http,https,tcp,tls,crypto,data]"))
         
         // Misc
         checkError(mpv_set_option_string(mpv, "video-rotate", "no"))
@@ -406,9 +437,100 @@ nonisolated final class MPVPlayerController: UIViewController {
         print("MPV: Subtitles disabled")
     }
     
-    func addExternalSubtitle(_ path: String) {
-        command("sub-add", args: [path, "select"])
-        print("MPV: Added external subtitle: \(path)")
+    func addExternalSubtitle(_ fileURL: URL) {
+        if !fileURL.isFileURL {
+            let remote = fileURL.absoluteString
+            let addStatus = commandStatus("sub-add", args: [remote])
+            var statuses = ["sub-add=\(addStatus)"]
+
+            if addStatus < 0 {
+                let appendStatus = setPropertyStringStatus("sub-files-append", remote)
+                statuses.append("sub-files-append=\(appendStatus)")
+            }
+
+            let sidStatus = commandStatus("set", args: ["sid", "auto"])
+            statuses.append("sid=\(sidStatus)")
+            print("MPV: Added remote subtitle url=\(remote) statuses=\(statuses.joined(separator: ", "))")
+            return
+        }
+
+        let normalizedURL = fileURL.standardizedFileURL.resolvingSymlinksInPath()
+
+        // Stage subtitle into a short, predictable app-local path to avoid
+        // occasional libmpv fopen issues with some sandbox paths.
+        let stagedURL = stageSubtitleForMPV(from: normalizedURL) ?? normalizedURL
+        let canonicalPath = stagedURL.path
+        let privatePath: String? = {
+            guard canonicalPath.hasPrefix("/var/") else { return nil }
+            return "/private" + canonicalPath
+        }()
+
+        let candidatePaths = [privatePath, canonicalPath].compactMap { $0 }
+        let candidateURLs = candidatePaths.compactMap { path -> String? in
+            URL(fileURLWithPath: path).absoluteString
+        }
+        var commandStatuses: [String] = []
+        for candidate in candidatePaths + candidateURLs {
+            let addStatus = commandStatus("sub-add", args: [candidate])
+            commandStatuses.append("sub-add(\(candidate))=\(addStatus)")
+            if addStatus >= 0 {
+                let sidStatus = commandStatus("set", args: ["sid", "auto"])
+                commandStatuses.append("set(sid auto)=\(sidStatus)")
+                break
+            }
+
+            let propertyStatus = setPropertyStringStatus("sub-files-append", candidate)
+            commandStatuses.append("set(sub-files-append)=\(propertyStatus)")
+            if propertyStatus >= 0 {
+                let sidStatus = commandStatus("set", args: ["sid", "auto"])
+                commandStatuses.append("set(sid auto)=\(sidStatus)")
+                break
+            }
+        }
+
+        let readableCanonical = FileManager.default.isReadableFile(atPath: canonicalPath)
+        let readablePrivate = privatePath.map { FileManager.default.isReadableFile(atPath: $0) } ?? false
+        print("MPV: Added external subtitle staged=\(canonicalPath) readable(canonical)=\(readableCanonical) readable(private)=\(readablePrivate) statuses=\(commandStatuses.joined(separator: ", "))")
+    }
+
+    private func stageSubtitleForMPV(from sourceURL: URL) -> URL? {
+        let fileManager = FileManager.default
+        let baseDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? fileManager.temporaryDirectory
+        let stageDir = baseDir.appendingPathComponent("mpv_subtitles", isDirectory: true)
+
+        do {
+            try fileManager.createDirectory(at: stageDir, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+
+        let ext = sourceURL.pathExtension.isEmpty ? "srt" : sourceURL.pathExtension
+        let baseName = sanitizedSubtitleBaseName(from: sourceURL)
+        let stagedURL = stageDir.appendingPathComponent("\(baseName).\(ext)")
+
+        do {
+            if fileManager.fileExists(atPath: stagedURL.path) {
+                try fileManager.removeItem(at: stagedURL)
+            }
+            try fileManager.copyItem(at: sourceURL, to: stagedURL)
+            try? fileManager.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: stagedURL.path)
+            return stagedURL
+        } catch {
+            return nil
+        }
+    }
+
+    private func sanitizedSubtitleBaseName(from sourceURL: URL) -> String {
+        let raw = sourceURL.deletingPathExtension().lastPathComponent
+        let cleaned = raw.replacingOccurrences(of: #"[^a-zA-Z0-9._ -]+"#, with: "_", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if cleaned.isEmpty {
+            return "Downloaded Subtitle"
+        }
+        return cleaned
     }
     
     // MARK: - Video Track Controls (for AirPlay resource management)
@@ -450,13 +572,32 @@ nonisolated final class MPVPlayerController: UIViewController {
     
     // MARK: - C API Helpers
     
-    private func command(_ cmd: String, args: [String] = []) {
-        guard let mpv else { return }
+    @discardableResult
+    private func commandStatus(_ cmd: String, args: [String] = []) -> CInt {
+        guard let mpv else { return -1 }
         var allArgs: [String?] = [cmd] + args + [nil]
         let cStrings = allArgs.map { $0.flatMap { strdup($0) } }
         defer { cStrings.forEach { $0.map { free($0) } } }
         var ptrs = cStrings.map { $0.map { UnsafePointer($0) } }
-        mpv_command(mpv, &ptrs)
+        let status = mpv_command(mpv, &ptrs)
+        if status < 0 {
+            print("MPV command error [\(cmd)]: \(String(cString: mpv_error_string(status)))")
+        }
+        return status
+    }
+
+    private func command(_ cmd: String, args: [String] = []) {
+        _ = commandStatus(cmd, args: args)
+    }
+
+    @discardableResult
+    private func setPropertyStringStatus(_ property: String, _ value: String) -> CInt {
+        guard let mpv else { return -1 }
+        let status = mpv_set_property_string(mpv, property, value)
+        if status < 0 {
+            print("MPV property error [\(property)]: \(String(cString: mpv_error_string(status)))")
+        }
+        return status
     }
     
     private func getDouble(_ name: String) -> Double {

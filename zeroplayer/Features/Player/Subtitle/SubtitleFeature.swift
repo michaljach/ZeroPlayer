@@ -2,17 +2,28 @@ import ComposableArchitecture
 import Foundation
 import UniformTypeIdentifiers
 
-/// Child feature managing subtitle track selection and external file import.
 struct SubtitleFeature: Reducer {
+    struct InternetSubtitleLanguage: Equatable, Identifiable {
+        let code: String
+        let name: String
+
+        var id: String { code }
+    }
+
     @ObservableState
     struct State: Equatable {
         var mpvTracks: [MPVSubtitleTrack] = []
         var selectedMPVTrackId: Int? = nil
         var isShowingFilePicker = false
         var error: String? = nil
-        var isDownloading = false
         var hlsTracks: [SubtitleTrack] = []
         var selectedHLSTrack: SubtitleTrack? = nil
+
+        var isShowingInternetSubtitleSheet = false
+        var internetSubtitleLanguageCode = SubtitleFeature.defaultLanguageCode
+        var internetSubtitles: [InternetSubtitleOption] = []
+        var isSearchingInternetSubtitles = false
+        var isDownloadingInternetSubtitle = false
     }
 
     @CasePathable
@@ -28,11 +39,18 @@ struct SubtitleFeature: Reducer {
         case hlsSelectedSubtitleUpdated(SubtitleTrack?)
 
         case loadFromFileTapped
-        case downloadFromInternetTapped
-        case downloadSucceeded(URL)
-        case downloadFailed(String)
         case filePickerDismissed
         case filePickerResult(Result<[URL], Error>)
+
+        case downloadFromInternetTapped
+        case internetSubtitleSheetDismissed
+        case internetSubtitleLanguageChanged(String)
+        case internetSubtitleSearchStarted
+        case internetSubtitleSearchSucceeded([InternetSubtitleOption])
+        case internetSubtitleSearchFailed(String)
+        case internetSubtitleDownloadTapped(InternetSubtitleOption)
+        case internetSubtitleDownloadSucceeded(URL)
+        case internetSubtitleDownloadFailed(String)
 
         case delegate(Delegate)
 
@@ -42,7 +60,8 @@ struct SubtitleFeature: Reducer {
             case selectHLSSubtitle(SubtitleTrack)
             case disableHLSSubtitles
             case addExternalSubtitleHLS(URL)
-            case downloadFromInternetRequested
+            case searchInternetSubtitles(languageCode: String)
+            case downloadInternetSubtitle(InternetSubtitleOption)
         }
     }
 
@@ -83,20 +102,6 @@ struct SubtitleFeature: Reducer {
             state.isShowingFilePicker = true
             return .none
 
-        case .downloadFromInternetTapped:
-            state.isDownloading = true
-            state.error = nil
-            return .send(.delegate(.downloadFromInternetRequested))
-
-        case .downloadSucceeded:
-            state.isDownloading = false
-            return .none
-
-        case .downloadFailed(let message):
-            state.isDownloading = false
-            state.error = message
-            return .none
-
         case .filePickerDismissed:
             state.isShowingFilePicker = false
             return .none
@@ -129,6 +134,57 @@ struct SubtitleFeature: Reducer {
             state.error = "Failed to pick subtitle file: \(error.localizedDescription)"
             return .none
 
+        case .downloadFromInternetTapped:
+            state.error = nil
+            state.isShowingInternetSubtitleSheet = true
+            state.internetSubtitles = []
+            state.isSearchingInternetSubtitles = true
+            return .send(.delegate(.searchInternetSubtitles(languageCode: state.internetSubtitleLanguageCode)))
+
+        case .internetSubtitleSheetDismissed:
+            state.isShowingInternetSubtitleSheet = false
+            state.isSearchingInternetSubtitles = false
+            state.isDownloadingInternetSubtitle = false
+            return .none
+
+        case .internetSubtitleLanguageChanged(let code):
+            state.internetSubtitleLanguageCode = code
+            state.isSearchingInternetSubtitles = true
+            state.internetSubtitles = []
+            state.error = nil
+            return .send(.delegate(.searchInternetSubtitles(languageCode: code)))
+
+        case .internetSubtitleSearchStarted:
+            state.isSearchingInternetSubtitles = true
+            state.error = nil
+            return .none
+
+        case .internetSubtitleSearchSucceeded(let subtitles):
+            state.isSearchingInternetSubtitles = false
+            state.internetSubtitles = subtitles
+            return .none
+
+        case .internetSubtitleSearchFailed(let message):
+            state.isSearchingInternetSubtitles = false
+            state.internetSubtitles = []
+            state.error = message
+            return .none
+
+        case .internetSubtitleDownloadTapped(let subtitle):
+            state.isDownloadingInternetSubtitle = true
+            state.error = nil
+            return .send(.delegate(.downloadInternetSubtitle(subtitle)))
+
+        case .internetSubtitleDownloadSucceeded:
+            state.isDownloadingInternetSubtitle = false
+            state.isShowingInternetSubtitleSheet = false
+            return .none
+
+        case .internetSubtitleDownloadFailed(let message):
+            state.isDownloadingInternetSubtitle = false
+            state.error = message
+            return .none
+
         case .delegate:
             return .none
         }
@@ -142,4 +198,33 @@ struct SubtitleFeature: Reducer {
         if let ssa = UTType(filenameExtension: "ssa") { types.append(ssa) }
         return types
     }()
+
+    static let internetSubtitleLanguages: [InternetSubtitleLanguage] = [
+        .init(code: "any", name: "Any"),
+        .init(code: "en", name: "English"),
+        .init(code: "es", name: "Spanish"),
+        .init(code: "fr", name: "French"),
+        .init(code: "de", name: "German"),
+        .init(code: "it", name: "Italian"),
+        .init(code: "pt", name: "Portuguese"),
+        .init(code: "ru", name: "Russian"),
+        .init(code: "ja", name: "Japanese"),
+        .init(code: "ko", name: "Korean"),
+        .init(code: "zh", name: "Chinese"),
+        .init(code: "ar", name: "Arabic"),
+        .init(code: "hi", name: "Hindi"),
+        .init(code: "tr", name: "Turkish"),
+        .init(code: "nl", name: "Dutch"),
+        .init(code: "pl", name: "Polish")
+    ]
+
+    static var defaultLanguageCode: String {
+        if let preferred = Locale.preferredLanguages.first {
+            let code = String(preferred.prefix(2)).lowercased()
+            if internetSubtitleLanguages.contains(where: { $0.code == code }) {
+                return code
+            }
+        }
+        return "en"
+    }
 }
