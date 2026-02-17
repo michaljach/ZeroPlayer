@@ -1246,7 +1246,12 @@ final class FFmpegService {
         var swrCtx: OpaquePointer?  // SwrContext for sample format conversion
         var audioFifo: OpaquePointer?  // AVAudioFifo* for buffering resampled audio
         var audioTranscodeInputIdx: Int = -1
-        var audioNextPts: Int64 = 0  // Running PTS counter for AAC encoder output
+        // Running PTS counter for AAC encoder output.
+        // Initialized to 0; will be set to the first decoded audio frame's PTS
+        // when audio transcoding starts, so transcoded audio aligns with the
+        // segment's actual position in the timeline.
+        var audioNextPts: Int64 = 0
+        var audioNextPtsInitialized = false
         
         // Video transcoding state (for HEVC→H.264, lazily initialized)
         var videoDecCtx: UnsafeMutablePointer<AVCodecContext>?
@@ -1683,12 +1688,18 @@ final class FFmpegService {
         
         var wroteAnyPacket = false
         
-        // Track the start time offset so each segment's timestamps start at 0.
-        // We capture the first video DTS in INPUT timebase, then subtract the
-        // equivalent value from all packets (video uses rescaled offset, audio
-        // already starts from 0 via audioNextPts).
-        var videoDtsOffsetInputTB: Int64? = nil  // First video DTS in input timebase
+        // Track the first video DTS for debug logging.
+        var videoDtsOffsetInputTB: Int64? = nil  // First video DTS in input timebase (for logging)
         var videoPacketCount = 0  // Debug counter for first few video packets
+        
+        // --- HLS keyframe alignment ---
+        // HLS segments MUST start with a video keyframe (IDR frame) so that each
+        // segment is independently decodable. After seeking, the demuxer may
+        // return non-keyframe packets first (B/P frames from the preceding GOP).
+        // We skip ALL packets (video + audio) until the first video keyframe
+        // is found. Audio packets before the keyframe are useless anyway since
+        // the player can't display video for that time range.
+        var foundFirstVideoKeyframe = false
         
         // --- Fix AV_NOPTS_VALUE DTS from MKV demuxer ---
         // MKV demuxer delivers video packets in decode order but does NOT compute
@@ -1731,10 +1742,41 @@ final class FFmpegService {
                 ptsSeconds = startTime
             }
             
-            // Skip packets before our start time (seek may land before the target)
-            if ptsSeconds < startTime - 1.0 {
-                av_packet_unref(pkt)
-                continue
+            // --- Keyframe gate: skip all packets until first video keyframe ---
+            // HLS segments MUST start with a video keyframe (IDR frame) so that each
+            // segment is independently decodable. After seeking, the demuxer may
+            // return non-keyframe packets first (B/P frames from the preceding GOP),
+            // or it may land on a keyframe far before the target time if the GOP
+            // interval is large.
+            //
+            // Strategy: skip ALL packets until we find a video keyframe whose PTS
+            // is within a reasonable window of the segment start time. For segment 0
+            // (startTime == 0), accept any keyframe. For later segments, require the
+            // keyframe PTS to be >= startTime - segmentDuration to avoid grabbing a
+            // keyframe from a much earlier position (which would duplicate content).
+            if !foundFirstVideoKeyframe {
+                let isVideo = inputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO
+                if isVideo {
+                    let isKeyframe = (pkt.pointee.flags & AV_PKT_FLAG_KEY) != 0
+                    // Accept a keyframe if it's close enough to the target start time.
+                    // For segment 0, any keyframe is fine. For later segments, the
+                    // keyframe must be within one segment duration before startTime.
+                    let keyframeMinTime = startTime > 0 ? startTime - duration : 0.0
+                    if isKeyframe && ptsSeconds >= keyframeMinTime {
+                        foundFirstVideoKeyframe = true
+                        // Continue to process this keyframe packet below
+                    } else {
+                        // Either not a keyframe, or a keyframe too far before our
+                        // target time — skip it
+                        av_packet_unref(pkt)
+                        continue
+                    }
+                } else {
+                    // Audio/other packet before first video keyframe — skip it
+                    // (audio before the keyframe can't be displayed in sync)
+                    av_packet_unref(pkt)
+                    continue
+                }
             }
             
             // Stop after reaching end time (only on video keyframes to avoid cutting mid-GOP)
@@ -1768,6 +1810,20 @@ final class FFmpegService {
                 while true {
                     ret = avcodec_receive_frame(decCtx, audioFrame)
                     if ret < 0 { break }
+                    
+                    // Initialize audioNextPts from the first decoded audio frame
+                    // so transcoded audio timestamps align with the segment's
+                    // position in the overall timeline (not starting from 0).
+                    if !audioNextPtsInitialized {
+                        let avNoPTSLocal = Int64(bitPattern: UInt64(0x8000000000000000))
+                        if audioFrame.pointee.pts != avNoPTSLocal {
+                            // Convert from decoder time_base to encoder time_base
+                            let decTB = decCtx.pointee.time_base
+                            let encTB = encCtx.pointee.time_base
+                            audioNextPts = av_rescale_q(audioFrame.pointee.pts, decTB, encTB)
+                        }
+                        audioNextPtsInitialized = true
+                    }
                     
                     // Resample using swr_convert_frame into a temporary frame
                     var resFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
@@ -2008,6 +2064,7 @@ final class FFmpegService {
                 let origPts = pkt.pointee.pts
                 
                 // Fix AV_NOPTS_VALUE DTS: assign monotonic counter value
+                // (MKV demuxer may not compute DTS for B-frame reorder depth)
                 if pkt.pointee.dts == avNoPTS {
                     pkt.pointee.dts = videoDtsCounter
                     videoDtsCounter = videoDtsCounter &+ videoFrameDurationInputTB
@@ -2018,21 +2075,22 @@ final class FFmpegService {
                     }
                 }
                 
-                // Capture the DTS offset from the first video packet (now always valid)
+                // Log first video packet for debugging
                 if videoDtsOffsetInputTB == nil {
                     videoDtsOffsetInputTB = pkt.pointee.dts
-                    print("DTS normalization: video offset = \(videoDtsOffsetInputTB!) in input TB (\(inputStream.pointee.time_base.num)/\(inputStream.pointee.time_base.den))")
-                    print("  first video pkt: dts=\(pkt.pointee.dts) pts=\(pkt.pointee.pts) flags=\(pkt.pointee.flags)")
+                    let isKey = (pkt.pointee.flags & AV_PKT_FLAG_KEY) != 0
+                    print("Segment video start: dts=\(pkt.pointee.dts) pts=\(pkt.pointee.pts) flags=\(pkt.pointee.flags) keyframe=\(isKey) (input TB: \(inputStream.pointee.time_base.num)/\(inputStream.pointee.time_base.den))")
                 }
                 
-                // Subtract offset in input timebase BEFORE rescaling
-                let off = videoDtsOffsetInputTB!
-                pkt.pointee.dts = pkt.pointee.dts &- off
-                if pkt.pointee.pts != avNoPTS {
-                    pkt.pointee.pts = pkt.pointee.pts &- off
-                }
+                // --- Preserve original timestamps (no zero-normalization) ---
+                // HLS MPEG-TS segments carry their original source timestamps.
+                // AVPlayer uses the MPEG-TS PCR and internal PTS/DTS to place
+                // frames on the correct position in the timeline. Zero-normalizing
+                // DTS would cause all segments to appear to start at t=0, breaking
+                // playback when segments don't align to exact playlist boundaries
+                // (e.g., when keyframe intervals don't match segment duration).
                 
-                // Ensure DTS <= PTS (required for valid fMP4)
+                // Ensure DTS <= PTS (required for valid MPEG-TS)
                 if pkt.pointee.pts != avNoPTS && pkt.pointee.dts > pkt.pointee.pts {
                     pkt.pointee.dts = pkt.pointee.pts
                 }
