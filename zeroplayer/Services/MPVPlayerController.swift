@@ -1,4 +1,14 @@
+import Foundation
+import QuartzCore
+#if canImport(UIKit)
 import UIKit
+typealias PlatformViewController = UIViewController
+typealias PlatformColor = UIColor
+#elseif canImport(AppKit)
+import AppKit
+typealias PlatformViewController = NSViewController
+typealias PlatformColor = NSColor
+#endif
 import Libmpv
 
 // MARK: - Metal Layer (sublayer approach, matches MPVKit Demo)
@@ -74,12 +84,12 @@ struct MPVSubtitleTrack: Identifiable, Hashable {
 
 // MARK: - MPVPlayerController
 
-/// UIViewController that wraps libmpv with Metal rendering via MoltenVK.
+/// Platform view controller that wraps libmpv with Metal rendering via MoltenVK.
 /// Manages the mpv lifecycle, event loop, and exposes playback controls.
 ///
 /// This class is `nonisolated` because mpv callbacks fire on background queues.
 /// All UI updates are dispatched to the main thread via `onPropertyChange`.
-nonisolated final class MPVPlayerController: UIViewController {
+nonisolated final class MPVPlayerController: PlatformViewController {
     
     // mpv handle
     private var mpv: OpaquePointer?
@@ -101,16 +111,25 @@ nonisolated final class MPVPlayerController: UIViewController {
     
     override func viewDidLoad() {
         super.viewDidLoad()
+#if canImport(UIKit)
         view.backgroundColor = .black
+#elseif canImport(AppKit)
+        view.wantsLayer = true
+        view.layer?.backgroundColor = PlatformColor.black.cgColor
+#endif
         
         // Add Metal layer as a sublayer (matches MPVKit Demo pattern).
         // The layer frame is explicitly updated in viewDidLayoutSubviews
         // to ensure MoltenVK recreates the Vulkan swapchain on rotation.
         metalLayer.frame = view.bounds
+#if canImport(UIKit)
         metalLayer.contentsScale = UIScreen.main.nativeScale
+#elseif canImport(AppKit)
+        metalLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+#endif
         metalLayer.framebufferOnly = true
-        metalLayer.backgroundColor = UIColor.black.cgColor
-        view.layer.addSublayer(metalLayer)
+        metalLayer.backgroundColor = PlatformColor.black.cgColor
+      view.layer.addSublayer(metalLayer)
         
         setupMPV()
         setupNotifications()
@@ -121,9 +140,19 @@ nonisolated final class MPVPlayerController: UIViewController {
         }
     }
     
+    #if canImport(UIKit)
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        
+        updateMetalLayerLayout()
+    }
+    #elseif canImport(AppKit)
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        updateMetalLayerLayout()
+    }
+    #endif
+
+    private func updateMetalLayerLayout() {
         let newSize = view.bounds.size
         metalLayer.frame = view.bounds
         
@@ -229,12 +258,21 @@ nonisolated final class MPVPlayerController: UIViewController {
     // MARK: - Background/Foreground Lifecycle
     
     private func setupNotifications() {
+#if canImport(UIKit)
         NotificationCenter.default.addObserver(
             self, selector: #selector(didEnterBackground),
             name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(
             self, selector: #selector(willEnterForeground),
             name: UIApplication.willEnterForegroundNotification, object: nil)
+#elseif canImport(AppKit)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(didEnterBackground),
+            name: NSApplication.didResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(willEnterForeground),
+            name: NSApplication.didBecomeActiveNotification, object: nil)
+#endif
     }
     
     @objc private func didEnterBackground() {

@@ -62,17 +62,28 @@ struct InternetSubtitleSheetView: View {
         }
         .padding()
         .navigationTitle("Download Subtitles")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                if store.isDownloadingInternetSubtitle {
-                    ProgressView()
-                }
-            }
-        }
+        .toolbar { toolbarContent }
         .onAppear {
             if store.internetSubtitles.isEmpty && !store.isSearchingInternetSubtitles {
                 store.send(.internetSubtitleLanguageChanged(store.internetSubtitleLanguageCode))
             }
         }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+#if os(macOS)
+        ToolbarItem(placement: .automatic) {
+            if store.isDownloadingInternetSubtitle {
+                ProgressView()
+            }
+        }
+#else
+        ToolbarItem(placement: .topBarTrailing) {
+            if store.isDownloadingInternetSubtitle {
+                ProgressView()
+            }
+        }
+#endif
     }
 }

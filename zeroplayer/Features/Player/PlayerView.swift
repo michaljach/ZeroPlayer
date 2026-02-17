@@ -159,9 +159,13 @@ struct PlayerView: View {
     // MARK: - Safe Area
     
     private var safeAreaTop: CGFloat {
+#if canImport(UIKit)
         UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .first?.windows.first?.safeAreaInsets.top ?? 0
+#else
+        0
+#endif
     }
     
     // MARK: - Controls Overlay
@@ -383,6 +387,7 @@ struct PlayerView: View {
     // MARK: - Auto-Rotation
     
     private func rotateToLandscape() {
+#if canImport(UIKit)
         guard let windowScene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene }).first else { return }
         
@@ -393,9 +398,11 @@ struct PlayerView: View {
         if let rootVC = windowScene.windows.first?.rootViewController {
             rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
         }
+#endif
     }
     
     private func rotateToPortrait() {
+#if canImport(UIKit)
         guard let windowScene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene }).first else { return }
         
@@ -406,6 +413,7 @@ struct PlayerView: View {
         if let rootVC = windowScene.windows.first?.rootViewController {
             rootVC.setNeedsUpdateOfSupportedInterfaceOrientations()
         }
+#endif
     }
     
     // MARK: - AirPlay Route Picker
@@ -539,14 +547,25 @@ struct PlayerView: View {
                     }
                 )
             }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
-                        isShowingSubtitleOptionsSheet = false
-                    }
-                }
+            .toolbar { subtitleOptionsToolbar }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var subtitleOptionsToolbar: some ToolbarContent {
+#if os(macOS)
+        ToolbarItem(placement: .automatic) {
+            Button("Done") {
+                isShowingSubtitleOptionsSheet = false
             }
         }
+#else
+        ToolbarItem(placement: .topBarTrailing) {
+            Button("Done") {
+                isShowingSubtitleOptionsSheet = false
+            }
+        }
+#endif
     }
     
     // MARK: - AirPlay Activation / Deactivation
@@ -642,13 +661,17 @@ struct PlayerView: View {
         let newPlayer = AVPlayer(playerItem: playerItem)
         newPlayer.automaticallyWaitsToMinimizeStalling = true
         newPlayer.allowsExternalPlayback = true
+#if os(iOS) || targetEnvironment(macCatalyst)
         newPlayer.usesExternalPlaybackWhileExternalScreenIsActive = true
+#endif
         
         // Configure audio session for AirPlay
         do {
+#if os(iOS) || targetEnvironment(macCatalyst)
             let audioSession = AVAudioSession.sharedInstance()
             try audioSession.setCategory(.playback, mode: .moviePlayback)
             try audioSession.setActive(true)
+#endif
         } catch {
             print("Failed to configure audio session: \(error)")
         }
@@ -888,8 +911,9 @@ struct PlayerView: View {
     }
 }
 
-// MARK: - MPV UIViewControllerRepresentable
+// MARK: - MPV Representable
 
+#if canImport(UIKit)
 struct MPVRepresentableView: UIViewControllerRepresentable {
     @Binding var controller: MPVPlayerController?
     let fileURL: URL
@@ -897,7 +921,7 @@ struct MPVRepresentableView: UIViewControllerRepresentable {
     var onSubtitleTracksDiscovered: ((_ tracks: [MPVSubtitleTrack]) -> Void)?
     var onFileLoaded: (() -> Void)?
     var onFileEnded: (() -> Void)?
-    
+
     func makeUIViewController(context: Context) -> MPVPlayerController {
         let vc = MPVPlayerController()
         vc.fileURL = fileURL
@@ -907,7 +931,7 @@ struct MPVRepresentableView: UIViewControllerRepresentable {
         vc.onFileEnded = onFileEnded
         return vc
     }
-    
+
     func updateUIViewController(_ uiViewController: MPVPlayerController, context: Context) {
         DispatchQueue.main.async {
             if self.controller == nil {
@@ -916,3 +940,31 @@ struct MPVRepresentableView: UIViewControllerRepresentable {
         }
     }
 }
+#elseif canImport(AppKit)
+struct MPVRepresentableView: NSViewControllerRepresentable {
+    @Binding var controller: MPVPlayerController?
+    let fileURL: URL
+    var onPropertyChange: ((_ property: String, _ value: Any?) -> Void)?
+    var onSubtitleTracksDiscovered: ((_ tracks: [MPVSubtitleTrack]) -> Void)?
+    var onFileLoaded: (() -> Void)?
+    var onFileEnded: (() -> Void)?
+
+    func makeNSViewController(context: Context) -> MPVPlayerController {
+        let vc = MPVPlayerController()
+        vc.fileURL = fileURL
+        vc.onPropertyChange = onPropertyChange
+        vc.onSubtitleTracksDiscovered = onSubtitleTracksDiscovered
+        vc.onFileLoaded = onFileLoaded
+        vc.onFileEnded = onFileEnded
+        return vc
+    }
+
+    func updateNSViewController(_ nsViewController: MPVPlayerController, context: Context) {
+        DispatchQueue.main.async {
+            if self.controller == nil {
+                self.controller = nsViewController
+            }
+        }
+    }
+}
+#endif

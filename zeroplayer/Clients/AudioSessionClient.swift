@@ -24,12 +24,15 @@ nonisolated private final class ObserverTokenBox: @unchecked Sendable {
 extension AudioSessionClient: DependencyKey {
     static let liveValue = AudioSessionClient(
         configure: {
+#if os(iOS) || targetEnvironment(macCatalyst)
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .moviePlayback)
             try session.setActive(true)
+#endif
         },
         airPlayRouteChanges: {
             AsyncStream { continuation in
+#if os(iOS) || targetEnvironment(macCatalyst)
                 let observer = NotificationCenter.default.addObserver(
                     forName: AVAudioSession.routeChangeNotification,
                     object: nil,
@@ -55,11 +58,19 @@ extension AudioSessionClient: DependencyKey {
                         NotificationCenter.default.removeObserver(observerBox.token)
                     }
                 }
+#else
+                continuation.yield(false)
+                continuation.finish()
+#endif
             }
         },
         isAirPlayActive: {
+#if os(iOS) || targetEnvironment(macCatalyst)
             let currentRoute = AVAudioSession.sharedInstance().currentRoute
             return currentRoute.outputs.contains { $0.portType == .airPlay }
+#else
+            return false
+#endif
         }
     )
     
