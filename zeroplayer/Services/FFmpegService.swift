@@ -220,6 +220,141 @@ final class FFmpegService {
         )
     }
 
+    /// Probes video keyframe positions and builds segment boundaries aligned to keyframes.
+    ///
+    /// Scans the source file reading only packet headers (no decoding) to find
+    /// video keyframe (IDR) timestamps. Groups keyframes into ~10s segments:
+    /// each segment starts at the keyframe closest to the target boundary.
+    ///
+    /// Returns an array of (startTime, duration) pairs in seconds.
+    /// This is fast — only reads packet metadata, not payload data.
+    func probeSegmentBoundaries(from sourceURL: URL, totalDuration: Double, targetSegmentDuration: Double = 10.0) async throws -> [(start: Double, duration: Double)] {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[(start: Double, duration: Double)], Error>) in
+            encodeQueue.async {
+                self.encodeSemaphore.wait()
+                defer { self.encodeSemaphore.signal() }
+                do {
+                    let result = try self.probeSegmentBoundariesSync(from: sourceURL, totalDuration: totalDuration, targetSegmentDuration: targetSegmentDuration)
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+    
+    private func probeSegmentBoundariesSync(from sourceURL: URL, totalDuration: Double, targetSegmentDuration: Double) throws -> [(start: Double, duration: Double)] {
+        let inputPath = sourceURL.path
+        
+        var inputCtx: UnsafeMutablePointer<AVFormatContext>?
+        var ret = avformat_open_input(&inputCtx, inputPath, nil, nil)
+        guard ret >= 0, inputCtx != nil else {
+            throw FFmpegError.conversionFailed("probeSegmentBoundaries: avformat_open_input failed")
+        }
+        defer {
+            var ctx = inputCtx
+            avformat_close_input(&ctx)
+        }
+        
+        ret = avformat_find_stream_info(inputCtx, nil)
+        guard ret >= 0 else {
+            throw FFmpegError.conversionFailed("probeSegmentBoundaries: avformat_find_stream_info failed")
+        }
+        
+        // Find the video stream index
+        var videoStreamIdx = -1
+        let nbStreams = Int(inputCtx!.pointee.nb_streams)
+        for i in 0..<nbStreams {
+            if inputCtx!.pointee.streams[i]!.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO {
+                videoStreamIdx = i
+                break
+            }
+        }
+        guard videoStreamIdx >= 0 else {
+            throw FFmpegError.conversionFailed("probeSegmentBoundaries: no video stream found")
+        }
+        
+        let videoStream = inputCtx!.pointee.streams[videoStreamIdx]!
+        let timeBase = av_q2d(videoStream.pointee.time_base)
+        let avNoPTS = Int64(bitPattern: UInt64(0x8000000000000000))
+        
+        // Collect all video keyframe timestamps
+        var keyframeTimes: [Double] = []
+        
+        let pkt = av_packet_alloc()!
+        defer {
+            var p: UnsafeMutablePointer<AVPacket>? = pkt
+            av_packet_free(&p)
+        }
+        
+        // Use AVINDEX_KEYFRAME flag to read only keyframes via index if available.
+        // For MP4/MOV containers, the index is fast. For MKV, we scan packets.
+        // av_read_frame reads all packets; we filter for video keyframes.
+        while av_read_frame(inputCtx, pkt) >= 0 {
+            defer { av_packet_unref(pkt) }
+            
+            guard Int(pkt.pointee.stream_index) == videoStreamIdx else { continue }
+            guard (pkt.pointee.flags & AV_PKT_FLAG_KEY) != 0 else { continue }
+            
+            let pts: Double
+            if pkt.pointee.pts != avNoPTS {
+                pts = Double(pkt.pointee.pts) * timeBase
+            } else if pkt.pointee.dts != avNoPTS {
+                pts = Double(pkt.pointee.dts) * timeBase
+            } else {
+                continue
+            }
+            
+            keyframeTimes.append(pts)
+        }
+        
+        guard !keyframeTimes.isEmpty else {
+            // Fallback: no keyframes found, use fixed 10s segments
+            print("probeSegmentBoundaries: no keyframes found, using fixed segments")
+            var segments: [(start: Double, duration: Double)] = []
+            var t = 0.0
+            while t < totalDuration {
+                let dur = min(targetSegmentDuration, totalDuration - t)
+                segments.append((start: t, duration: dur))
+                t += targetSegmentDuration
+            }
+            return segments
+        }
+        
+        // Sort keyframes (should already be sorted, but ensure)
+        keyframeTimes.sort()
+        
+        // Build segments: group keyframes into ~targetSegmentDuration chunks.
+        // A new segment starts when the next keyframe is at or past the next
+        // target boundary. This produces segments of roughly equal duration
+        // that always start at keyframe positions.
+        var segments: [(start: Double, duration: Double)] = []
+        var segStart = keyframeTimes[0]
+        var nextBoundary = segStart + targetSegmentDuration
+        
+        for i in 1..<keyframeTimes.count {
+            let kfTime = keyframeTimes[i]
+            if kfTime >= nextBoundary {
+                // Close current segment, start new one at this keyframe
+                let segDuration = kfTime - segStart
+                segments.append((start: segStart, duration: segDuration))
+                segStart = kfTime
+                nextBoundary = segStart + targetSegmentDuration
+            }
+        }
+        
+        // Final segment: from last segStart to end of file
+        let lastDuration = totalDuration - segStart
+        if lastDuration > 0 {
+            segments.append((start: segStart, duration: lastDuration))
+        }
+        
+        let maxDur = segments.map(\.duration).max() ?? 0
+        print("Probed \(keyframeTimes.count) keyframes -> \(segments.count) segments (max duration: \(String(format: "%.1f", maxDur))s)")
+        
+        return segments
+    }
+    
     /// Remuxes media for progressive HTTP streaming (fast start / moov at front).
     /// Uses passthrough (no re-encode) and returns a network-optimized MP4 URL.
     func prepareForDirectStreaming(_ sourceURL: URL) async throws -> URL {
@@ -271,9 +406,15 @@ final class FFmpegService {
         // Cache HEVC flag for segment generation
         self.sourceIsHEVC = videoInfo.isHEVC
         
-        // Calculate segments (10 seconds each)
-        let segmentDuration = 10.0
-        let totalSegments = Int(ceil(videoInfo.durationInSeconds / segmentDuration))
+        // Probe keyframe positions and build segment boundaries aligned to
+        // actual IDR frame times. This ensures every segment starts at a
+        // keyframe and the playlist EXTINF durations match real content.
+        let boundaries = try await probeSegmentBoundaries(
+            from: sourceURL,
+            totalDuration: videoInfo.durationInSeconds,
+            targetSegmentDuration: 10.0
+        )
+        self.segmentBoundaries = boundaries
         
         // --- Write variant playlist (video.m3u8) with segment entries ---
         // IMPORTANT: No leading whitespace — M3U8 tags must start at column 0
@@ -281,15 +422,18 @@ final class FFmpegService {
         // HEVC in MPEG-TS works with AVPlayer on iOS 11+ and avoids all fMP4
         // complexities that cause AirPlay rejection.
         
+        // Target duration must be the ceiling of the longest segment
+        let maxDuration = boundaries.map(\.duration).max() ?? 10.0
+        let targetDuration = Int(ceil(maxDuration))
+        
         var variant = "#EXTM3U\n"
         variant += "#EXT-X-VERSION:3\n"
-        variant += "#EXT-X-TARGETDURATION:11\n"
+        variant += "#EXT-X-TARGETDURATION:\(targetDuration)\n"
         variant += "#EXT-X-MEDIA-SEQUENCE:0\n"
         variant += "#EXT-X-PLAYLIST-TYPE:VOD\n"
         
-        for i in 0..<totalSegments {
-            let duration = min(segmentDuration, videoInfo.durationInSeconds - Double(i) * segmentDuration)
-            variant += "#EXTINF:\(String(format: "%.3f", duration)),\n"
+        for (i, seg) in boundaries.enumerated() {
+            variant += "#EXTINF:\(String(format: "%.3f", seg.duration)),\n"
             variant += "segment_\(String(format: "%03d", i)).ts\n"
         }
         
@@ -303,7 +447,7 @@ final class FFmpegService {
         let master = buildMasterPlaylist(videoInfo: videoInfo, subtitleTracks: subtitleTracks)
         try master.write(to: masterPath, atomically: true, encoding: .utf8)
         
-        print("HLS playlist ready: \(totalSegments) segments (master + variant)")
+        print("HLS playlist ready: \(boundaries.count) segments (master + variant)")
         
         return masterPath
     }
@@ -351,6 +495,7 @@ final class FFmpegService {
     }
     
     /// Generates a segmented HLS subtitle playlist that mirrors the video segment structure.
+    /// Uses probed keyframe-aligned segment boundaries to match video segments exactly.
     func generateSubtitlePlaylist(trackId: String, vttFileURL: URL, duration: Double, segmentDuration: Double = 10.0) throws -> URL {
         let playlistName = "sub_\(trackId).m3u8"
         let playlistPath = outputDirectory.appendingPathComponent(playlistName)
@@ -360,19 +505,32 @@ final class FFmpegService {
         let rawCues = Self.parseRawVTTCues(vttContent)
         print("Parsed \(rawCues.count) subtitle cues from \(vttFileURL.lastPathComponent)")
         
-        let totalSegments = Int(ceil(duration / segmentDuration))
+        // Use probed segment boundaries if available for exact alignment with video segments
+        let segments: [(start: Double, duration: Double)]
+        if !segmentBoundaries.isEmpty {
+            segments = segmentBoundaries
+        } else {
+            let totalSegments = Int(ceil(duration / segmentDuration))
+            segments = (0..<totalSegments).map { i in
+                let start = Double(i) * segmentDuration
+                let dur = min(segmentDuration, duration - start)
+                return (start: start, duration: dur)
+            }
+        }
+        
+        let maxDur = segments.map(\.duration).max() ?? segmentDuration
         
         // IMPORTANT: No leading whitespace — M3U8 tags must start at column 0
         var playlist = "#EXTM3U\n"
         playlist += "#EXT-X-VERSION:3\n"
-        playlist += "#EXT-X-TARGETDURATION:\(Int(ceil(segmentDuration)))\n"
+        playlist += "#EXT-X-TARGETDURATION:\(Int(ceil(maxDur)))\n"
         playlist += "#EXT-X-MEDIA-SEQUENCE:0\n"
         playlist += "#EXT-X-PLAYLIST-TYPE:VOD\n"
         
-        for i in 0..<totalSegments {
-            let segStart = Double(i) * segmentDuration
-            let segEnd = min(segStart + segmentDuration, duration)
-            let segDuration = segEnd - segStart
+        for (i, seg) in segments.enumerated() {
+            let segStart = seg.start
+            let segEnd = segStart + seg.duration
+            let segDuration = seg.duration
             
             // Find all cues that overlap with this segment's time range
             let segmentCues = rawCues.filter { cue in
@@ -406,7 +564,7 @@ final class FFmpegService {
         playlist += "#EXT-X-ENDLIST\n"
         
         try playlist.write(to: playlistPath, atomically: true, encoding: .utf8)
-        print("Generated segmented subtitle playlist: \(playlistName) (\(totalSegments) segments, \(rawCues.count) cues)")
+        print("Generated segmented subtitle playlist: \(playlistName) (\(segments.count) segments, \(rawCues.count) cues)")
         
         return playlistPath
     }
@@ -490,6 +648,13 @@ final class FFmpegService {
     /// Used by `generateSegment` to pick the right file extension.
     private(set) var sourceIsHEVC: Bool = false
     
+    /// Keyframe-aligned segment boundaries probed from the source file.
+    /// Each entry is the start time (in seconds) of a segment, where each
+    /// segment starts at a video keyframe. The last entry's duration extends
+    /// to the end of the file.
+    /// Set by `generateHLSPlaylist` and used by `generateSegment`.
+    private(set) var segmentBoundaries: [(start: Double, duration: Double)] = []
+    
     /// Generates a single HLS segment on-the-fly.
     ///
     /// Strategy:
@@ -518,8 +683,18 @@ final class FFmpegService {
         // Mark this segment as in-flight (empty waiter list)
         inFlightSegments[segmentIndex] = []
         
-        let startTime = Double(segmentIndex) * segmentDuration
-        print("Generating segment \(segmentIndex) (start: \(String(format: "%.1f", startTime))s)...")
+        // Use probed keyframe-aligned boundaries if available, otherwise fall
+        // back to fixed-duration segments.
+        let startTime: Double
+        let duration: Double
+        if segmentIndex < segmentBoundaries.count {
+            startTime = segmentBoundaries[segmentIndex].start
+            duration = segmentBoundaries[segmentIndex].duration
+        } else {
+            startTime = Double(segmentIndex) * segmentDuration
+            duration = segmentDuration
+        }
+        print("Generating segment \(segmentIndex) (start: \(String(format: "%.1f", startTime))s, duration: \(String(format: "%.1f", duration))s)...")
         
         do {
             try? FileManager.default.removeItem(at: segmentPath)
@@ -531,7 +706,7 @@ final class FFmpegService {
                     from: sourceURL,
                     to: segmentPath,
                     startTime: startTime,
-                    duration: segmentDuration
+                    duration: duration
                 )
                 print("Segment \(segmentIndex) generated via FFmpeg C API")
             } catch {
@@ -548,7 +723,7 @@ final class FFmpegService {
                     inputURL: sourceURL,
                     outputURL: tempPath,
                     startTime: startTime,
-                    duration: segmentDuration,
+                    duration: duration,
                     videoEncoder: .h264VideoToolbox
                 )
                 
@@ -3065,6 +3240,7 @@ final class FFmpegService {
     /// Cleans up temporary files
     func cleanup() {
         sourceIsHEVC = false
+        segmentBoundaries = []
         try? FileManager.default.removeItem(at: outputDirectory)
     }
 }

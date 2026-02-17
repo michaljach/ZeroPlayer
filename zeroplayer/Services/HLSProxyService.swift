@@ -141,8 +141,7 @@ final class HLSProxyService: SegmentGenerator {
             do {
                 let _ = try await ffmpegService.generateSegment(
                     from: url,
-                    segmentIndex: i,
-                    segmentDuration: 10.0
+                    segmentIndex: i
                 )
                 print("✅ Segment \(i) pre-generated")
             } catch {
@@ -261,8 +260,13 @@ final class HLSProxyService: SegmentGenerator {
         guard let videoInfo = currentVideoInfo,
               let sourceFile = sourceFileURL else { return }
         
-        let segmentDuration = 10.0
-        let totalSegments = Int(ceil(videoInfo.durationInSeconds / segmentDuration))
+        // Use probed segment count if available, otherwise fall back to fixed calculation
+        let totalSegments: Int
+        if !ffmpegService.segmentBoundaries.isEmpty {
+            totalSegments = ffmpegService.segmentBoundaries.count
+        } else {
+            totalSegments = Int(ceil(videoInfo.durationInSeconds / 10.0))
+        }
         
         guard startIndex < totalSegments else { return }
         
@@ -289,8 +293,7 @@ final class HLSProxyService: SegmentGenerator {
                 do {
                     let _ = try await self.ffmpegService.generateSegment(
                         from: sourceFile,
-                        segmentIndex: i,
-                        segmentDuration: segmentDuration
+                        segmentIndex: i
                     )
                     print("Look-ahead: segment \(i)/\(totalSegments - 1) ready")
                 } catch {
@@ -330,8 +333,7 @@ final class HLSProxyService: SegmentGenerator {
         do {
             let url = try await ffmpegService.generateSegment(
                 from: sourceFile,
-                segmentIndex: index,
-                segmentDuration: 10.0
+                segmentIndex: index
             )
             
             // Restart look-ahead from the next segment after this one
