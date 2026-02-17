@@ -1747,21 +1747,19 @@ final class FFmpegService {
             // segment is independently decodable. After seeking, the demuxer may
             // return non-keyframe packets first (B/P frames from the preceding GOP),
             // or it may land on a keyframe far before the target time if the GOP
-            // interval is large.
+            // interval is large (e.g., 10s GOP with 10s segments).
             //
             // Strategy: skip ALL packets until we find a video keyframe whose PTS
-            // is within a reasonable window of the segment start time. For segment 0
-            // (startTime == 0), accept any keyframe. For later segments, require the
-            // keyframe PTS to be >= startTime - segmentDuration to avoid grabbing a
-            // keyframe from a much earlier position (which would duplicate content).
+            // is close to the segment start time. For segment 0, accept any keyframe.
+            // For later segments, require the keyframe to be within 2 seconds before
+            // startTime to avoid content duplication between adjacent segments.
+            // If no keyframe falls in that window, we'll accept the next keyframe
+            // after startTime (reading forward through the stream).
             if !foundFirstVideoKeyframe {
                 let isVideo = inputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO
                 if isVideo {
                     let isKeyframe = (pkt.pointee.flags & AV_PKT_FLAG_KEY) != 0
-                    // Accept a keyframe if it's close enough to the target start time.
-                    // For segment 0, any keyframe is fine. For later segments, the
-                    // keyframe must be within one segment duration before startTime.
-                    let keyframeMinTime = startTime > 0 ? startTime - duration : 0.0
+                    let keyframeMinTime = startTime > 0 ? startTime - 2.0 : 0.0
                     if isKeyframe && ptsSeconds >= keyframeMinTime {
                         foundFirstVideoKeyframe = true
                         // Continue to process this keyframe packet below
